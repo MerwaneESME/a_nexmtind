@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Nextmind - Assistant Devis / Factures</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <div class="app">
+    <header class="topbar">
+      <div>
+        <p class="eyebrow">Assistant BTP</p>
+        <h1>Nextmind - Devis / Factures</h1>
+        <p class="subtitle">Pose tes questions ou analyse/génère des devis et factures (PDF/DOCX/PNG/JPG).</p>
+      </div>
+      <div class="status-dot">Connecté</div>
+    </header>
+
+    <section class="chat-panel">
+      <div class="messages" id="messages">
+        <div class="placeholder">Historique vide. Ajoute un fichier ou écris un message.</div>
+      </div>
+
+      <div id="quick-replies" class="quick-replies"></div>
+
+      <div class="dock">
+        <div class="dock-left">
+          <button id="attach-btn" type="button" title="Ajouter un fichier">+</button>
+          <input id="file-input" type="file" accept=".pdf,.docx,.png,.jpg,.jpeg" hidden>
+        </div>
+        <textarea id="chat-input" rows="2" placeholder="Message ou instructions..."></textarea>
+        <button id="send-btn" type="button">Envoyer</button>
+      </div>
+    </section>
+  </div>
+
+  <script src="/static/main.js"></script>
+</body>
+</html>

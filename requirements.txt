@@ -1,0 +1,18 @@
+langchain
+langgraph
+langchain-openai
+fastapi
+uvicorn
+pydantic
+jinja2
+pypdf
+python-docx
+pytesseract
+# optionnel pour traçage/observabilité
+langsmith
+# optionnel pour RAG Supabase/pgvector
+langchain-community
+psycopg[binary]
+supabase
+playwright
+python-multipart

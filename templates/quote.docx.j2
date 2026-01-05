@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8">
+  <style>
+    :root {
+      --accent: #0ea5e9;
+      --muted: #475569;
+      --border: #e2e8f0;
+      --bg: #f8fafc;
+      --text: #0f172a;
+      font-family: "Segoe UI", "Helvetica Neue", Arial, sans-serif;
+    }
+    body { margin: 0; padding: 24px; background: #ffffff; color: var(--text); }
+    .page { max-width: 900px; margin: 0 auto; background: white; padding: 32px; border: 1px solid #e2e8f0; border-radius: 12px; box-shadow: 0 10px 30px rgba(0,0,0,0.08); }
+    header { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 24px; }
+    .title { font-size: 26px; font-weight: 800; letter-spacing: -0.5px; color: var(--accent); }
+    .muted { color: var(--muted); font-size: 13px; }
+    .block { border: 1px solid var(--border); border-radius: 10px; padding: 12px 14px; margin-bottom: 12px; }
+    .label { font-weight: 700; font-size: 13px; text-transform: uppercase; color: var(--muted); margin-bottom: 6px; }
+    .name { font-weight: 700; font-size: 15px; }
+    table { width: 100%; border-collapse: collapse; margin-top: 10px; }
+    th, td { border: 1px solid var(--border); padding: 10px; font-size: 13px; text-align: left; }
+    th { background: #e6f4fb; font-weight: 700; }
+    .totals { margin-top: 16px; display: grid; gap: 8px; width: 280px; margin-left: auto; }
+    .totals .row { display: flex; justify-content: space-between; font-weight: 700; }
+    .notes { margin-top: 16px; border: 1px dashed var(--border); padding: 12px; border-radius: 10px; }
+    .tag { display: inline-block; padding: 4px 8px; border-radius: 999px; background: #e0f2fe; color: #0284c7; font-weight: 700; font-size: 12px; }
+  </style>
+</head>
+<body>
+  <div class="page">
+    <header>
+      <div>
+        <div class="title">Devis {{ number }}</div>
+        <div class="muted">Date : {{ date }}</div>
+      </div>
+      <div class="tag">BTP</div>
+    </header>
+
+    <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 12px; margin-bottom: 16px;">
+      <div class="block">
+        <div class="label">Fournisseur</div>
+        <div class="name">{{ supplier.name }}</div>
+        <div>{{ supplier.address }}</div>
+        {% if supplier.siret %}<div class="muted">SIRET : {{ supplier.siret }}</div>{% endif %}
+        {% if supplier.tva_number %}<div class="muted">TVA : {{ supplier.tva_number }}</div>{% endif %}
+        {% if supplier.contact %}<div class="muted">Contact : {{ supplier.contact }}</div>{% endif %}
+      </div>
+      <div class="block">
+        <div class="label">Client</div>
+        <div class="name">{{ customer.name }}</div>
+        <div>{{ customer.address }}</div>
+        {% if customer.siret %}<div class="muted">SIRET : {{ customer.siret }}</div>{% endif %}
+        {% if customer.tva_number %}<div class="muted">TVA : {{ customer.tva_number }}</div>{% endif %}
+        {% if customer.contact %}<div class="muted">Contact : {{ customer.contact }}</div>{% endif %}
+      </div>
+    </div>
+
+    <div class="block">
+      <div class="label">Détail des prestations</div>
+      <table>
+        <thead>
+          <tr>
+            <th>Description</th>
+            <th>Qté</th>
+            <th>Unité</th>
+            <th>PU HT</th>
+            <th>TVA %</th>
+            <th>Remise %</th>
+            <th>Total HT</th>
+            <th>Total TTC</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for item in line_items %}
+          <tr>
+            <td>{{ item.description }}</td>
+            <td>{{ item.quantity }}</td>
+            <td>{{ item.unit or "" }}</td>
+            <td>{{ item.unit_price_ht }} €</td>
+            <td>{{ item.vat_rate }}</td>
+            <td>{{ item.discount_rate or 0 }}</td>
+            <td>{{ item.total_ht }} €</td>
+            <td>{{ item.total_ttc }} €</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+
+    <div class="totals">
+      <div class="row"><span>Total HT</span><span>{{ totals.total_ht }} €</span></div>
+      <div class="row"><span>Total TVA</span><span>{{ totals.total_tva }} €</span></div>
+      <div class="row"><span>Total TTC</span><span>{{ totals.total_ttc }} €</span></div>
+    </div>
+
+    <div class="block" style="margin-top: 16px;">
+      <div class="label">Conditions</div>
+      {% if payment_terms %}<div>Conditions de paiement : {{ payment_terms }}</div>{% endif %}
+      {% if penalties_late_payment %}<div>Pénalités de retard : {{ penalties_late_payment }}</div>{% endif %}
+      {% if professional_liability %}<div>RC Pro : {{ professional_liability }}</div>{% endif %}
+      {% if dtu_references %}<div>Références DTU : {% for ref in dtu_references %}{{ ref }} {% endfor %}</div>{% endif %}
+    </div>
+
+    {% if notes %}
+    <div class="notes">
+      <div class="label">Notes</div>
+      <div>{{ notes }}</div>
+    </div>
+    {% endif %}
+  </div>
+</body>
+</html>

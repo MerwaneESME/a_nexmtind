@@ -1,0 +1,149 @@
+const analyzeForm = document.querySelector("#analyze-form");
+const generateForm = document.querySelector("#generate-form");
+const analyzeResult = document.querySelector("#analyze-result");
+const generateResult = document.querySelector("#generate-result");
+const progressBar = document.querySelector("#gen-progress");
+const previewBlock = document.querySelector("#preview");
+const previewFrame = document.querySelector("#preview-frame");
+const downloadLink = document.querySelector("#download-link");
+
+const formatJson = (data) => {
+  try {
+    return JSON.stringify(data, null, 2);
+  } catch {
+    return String(data);
+  }
+};
+
+const showProgress = (show) => {
+  if (!progressBar) return;
+  progressBar.classList.toggle("hidden", !show);
+};
+
+const clearPreview = () => {
+  if (!previewBlock) return;
+  previewBlock.classList.add("hidden");
+  previewFrame.src = "about:blank";
+  downloadLink.innerHTML = "";
+};
+
+const setPreview = (url, label = "PDF") => {
+  if (!previewBlock) return;
+  previewBlock.classList.remove("hidden");
+  previewFrame.src = url;
+  downloadLink.innerHTML = `<a href="${url}" target="_blank" download>Télécharger ${label}</a>`;
+};
+
+const renderAnalyze = (payload) => {
+  const { data, totals, inconsistencies, error, details } = payload || {};
+  analyzeResult.innerHTML = `
+    ${error ? `<div><strong>Erreur :</strong> ${error} ${details || ""}</div>` : ""}
+    ${totals ? `<div><strong>Totaux :</strong> ${formatJson(totals)}</div>` : ""}
+    ${inconsistencies?.length ? `<div><strong>Incohérences :</strong> ${formatJson(inconsistencies)}</div>` : ""}
+    ${data ? `<div><strong>Données :</strong><pre>${formatJson(data)}</pre></div>` : ""}
+  `;
+};
+
+const convertHtmlToPdfBlobUrl = async (htmlUrl) => {
+  const res = await fetch(htmlUrl, { cache: "no-cache" });
+  const html = await res.text();
+  const container = document.createElement("div");
+  container.style.position = "absolute";
+  container.style.left = "-9999px";
+  container.innerHTML = html;
+  document.body.appendChild(container);
+  const opt = {
+    margin: 0,
+    filename: "document.pdf",
+    image: { type: "jpeg", quality: 0.98 },
+    html2canvas: { scale: 2 },
+    jsPDF: { unit: "pt", format: "a4", orientation: "portrait" },
+  };
+  const pdfBlob = await html2pdf().from(container).set(opt).toPdf().output("blob");
+  document.body.removeChild(container);
+  return URL.createObjectURL(pdfBlob);
+};
+
+const renderGenerate = async (payload) => {
+  const { error, details, render_error, render_status, pdf_url, html_url, totals } = payload || {};
+  generateResult.innerHTML = `
+    ${error ? `<div><strong>Erreur :</strong> ${error} ${details || ""}</div>` : ""}
+    ${render_error ? `<div><strong>Rendu :</strong> ${render_error}</div>` : ""}
+    ${render_status ? `<div><strong>Statut rendu :</strong> ${render_status}</div>` : ""}
+    ${totals ? `<div><strong>Totaux :</strong> ${formatJson(totals)}</div>` : ""}
+  `;
+  clearPreview();
+
+  const previewUrl = pdf_url || html_url;
+  if (!previewUrl) return;
+
+  // Si PDF dispo, on l’affiche. Sinon, on fabrique un PDF côté client depuis le HTML.
+  if (pdf_url) {
+    setPreview(pdf_url, "PDF");
+  } else if (html_url && window.html2pdf) {
+    try {
+      const blobUrl = await convertHtmlToPdfBlobUrl(html_url);
+      setPreview(blobUrl, "PDF");
+    } catch (err) {
+      generateResult.innerHTML += `<div><strong>Erreur aperçu :</strong> ${err.message}</div>`;
+    }
+  } else {
+    generateResult.innerHTML += `<div><strong>Prévisualisation :</strong> HTML disponible, PDF non généré.</div>`;
+  }
+};
+
+analyzeForm?.addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const fd = new FormData(analyzeForm);
+  analyzeResult.textContent = "Analyse en cours...";
+  try {
+    const resp = await fetch(`/analyze?doc_type=${fd.get("doc_type")}`, { method: "POST", body: fd });
+    const text = await resp.text();
+    const json = (() => {
+      try {
+        return JSON.parse(text);
+      } catch (err) {
+        return { error: "parse_error", details: text };
+      }
+    })();
+    renderAnalyze(json);
+  } catch (err) {
+    analyzeResult.textContent = "Erreur: " + err.message;
+  }
+});
+
+generateForm?.addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const data = {
+    doc_type: generateForm.doc_type.value,
+    prompt: generateForm.prompt.value.trim(),
+  };
+  if (!data.prompt) {
+    generateResult.textContent = "Ajoute des instructions pour générer le document.";
+    return;
+  }
+  clearPreview();
+  showProgress(true);
+  generateResult.textContent = "Génération en cours...";
+  try {
+    const resp = await fetch("/generate_from_text", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(data),
+    });
+    const text = await resp.text();
+    const json = (() => {
+      try {
+        return JSON.parse(text);
+      } catch (err) {
+        return { error: "parse_error", details: text };
+      }
+    })();
+    await renderGenerate(json);
+  } catch (err) {
+    generateResult.textContent = "Erreur: " + err.message;
+  } finally {
+    showProgress(false);
+  }
+});
+

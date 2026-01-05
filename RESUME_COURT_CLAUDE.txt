@@ -1,0 +1,58 @@
+Bonjour Claude,
+
+Je travaille sur un projet d'agent IA spécialisé dans le BTP (Bâtiment et Travaux Publics) pour automatiser la création, l'analyse et la validation de devis et factures. Voici un résumé de la structure :
+
+ARCHITECTURE TECHNIQUE
+- Backend : FastAPI (Python 3.11) + LangGraph (orchestration workflow)
+- LLM : OpenAI GPT-4o-mini avec fallback GPT-4o
+- Base de données : Supabase (PostgreSQL + pgvector pour RAG)
+- Extraction : PyPDF, python-docx, pytesseract (OCR)
+
+WORKFLOW LANGGRAPH (4 nœuds séquentiels)
+1. InputNormalizerNode → Détecte intention (analyze/prepare_devis/validate/chat) et normalise l'entrée
+2. RAGRetrieverNode → Récupère contexte depuis Supabase (clients, matériaux, historiques) avec seuil 0.75
+3. BusinessToolsNode → Exécute outils métier :
+   - extract_pdf_tool (PDF/DOCX/images → texte)
+   - clean_lines_tool (nettoyage quantités/prix, dédoublonnage)
+   - calculate_totals_tool (HT/TVA/TTC + détection incohérences)
+   - validate_devis_tool (conformité TVA, pénalités, RC pro, mentions légales)
+   - supabase_lookup_tool (pré-remplissage clients/matériaux)
+4. LLMSynthesizerNode → Génère réponse finale JSON strict ou texte concis
+
+ENDPOINTS API
+- POST /chat : Chat conversationnel avec mémoire par thread
+- POST /analyze : Analyse fichiers (PDF/DOCX/images) → extraction + structuration + validation
+- POST /prepare-devis : Génération devis/facture depuis formulaire → nettoyage + calculs + synthèse LLM
+- GET /prepare-devis/prefill : Pré-remplissage depuis Supabase
+
+POINTS FORTS
+- Architecture modulaire avec prompts séparés par nœud
+- RAG intégré pour contexte historique
+- Validation métier automatique (conformité réglementaire française)
+- Support multi-format (PDF/DOCX/images)
+
+LIMITATIONS ACTUELLES
+- Gestion d'erreurs : beaucoup de try/except silencieux
+- Pas de logging structuré
+- Pas de tests unitaires
+- RAG toujours appelé même pour chats simples
+- Workflow linéaire (pas de branchements conditionnels)
+
+QUESTIONS POUR TOI
+1. Comment améliorer le workflow LangGraph ? (branchements conditionnels, optimisation RAG)
+2. Stratégie mémoire/contexte : gestion mémoire long terme, sessions multi-utilisateurs
+3. Optimisations performance : cache RAG, traitement asynchrone, batch processing
+4. Monitoring : logging structuré, métriques à suivre, intégration LangSmith
+5. Tests : structure recommandée, tests nœuds LangGraph individuellement
+6. Gestion erreurs : retry LLM, fallback gracieux, validation stricte
+7. Améliorations métier BTP : intégration DTU, calcul quantités automatique
+8. Génération documents : meilleure génération PDF, signatures électroniques
+9. CI/CD : pipeline recommandé, stratégie déploiement
+10. Frontend : intégration React/Next.js, WebSockets temps réel
+
+CONTEXTE MÉTIER
+Domaine BTP français avec réglementations spécifiques : TVA (20%/10%/5.5%), pénalités retard, RC pro obligatoire, mentions légales (SIRET/SIREN).
+
+Peux-tu me donner tes conseils et idées pour améliorer ce projet ? Notamment sur l'architecture LangGraph, l'optimisation RAG, la gestion de la mémoire, et les meilleures pratiques pour un agent IA métier de ce type.
+
+Merci !
