@@ -1,3 +1,4 @@
+"""Client Supabase pour persistance des données."""
 import os
 from typing import Any, Optional
 
@@ -112,10 +113,10 @@ def insert_invoice(sb: Client, data: dict):
 
 
 def upsert_document(data: dict):
-    """Insere ou met a jour un devis/facture dans Supabase."""
+    """Insère ou met à jour un devis/facture dans Supabase."""
     sb = get_client()
     if not sb:
-        return {"error": "Supabase client non configure (SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY manquants)"}
+        return {"error": "Supabase client non configuré"}
     try:
         if data.get("doc_type") == "invoice":
             return insert_invoice(sb, data)

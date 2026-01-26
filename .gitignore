@@ -11,4 +11,5 @@ __pycache__/
 /test-results/
 /supabase/.branches
 /supabase/.temp
+logs/
 

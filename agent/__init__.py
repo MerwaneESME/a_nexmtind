@@ -1,1 +1,1 @@
-# Package marker for the agent module.
+"""Agent IA BTP V2 - Version refaite et fonctionnelle."""

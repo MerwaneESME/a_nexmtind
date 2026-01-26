@@ -9,6 +9,28 @@ let pendingFile = null;
 let loading = false;
 let loadingBubble = null;
 let history = [];
+const THREAD_KEY = "agent_thread_id";
+const FORM_KEY = "agent_form_payload";
+
+const ensureThreadId = () => {
+  let id = sessionStorage.getItem(THREAD_KEY);
+  if (!id) {
+    id = crypto.randomUUID();
+    sessionStorage.setItem(THREAD_KEY, id);
+  }
+  return id;
+};
+
+const loadFormMeta = () => {
+  try {
+    const raw = localStorage.getItem(FORM_KEY);
+    if (!raw) return null;
+    return JSON.parse(raw);
+  } catch (e) {
+    console.warn("Impossible de parser le payload formulaire", e);
+    return null;
+  }
+};
 
 const escapeHtml = (str = "") =>
   str
@@ -175,10 +197,17 @@ const sendChat = async (text) => {
   addMessage("user", renderMarkdownLite(text));
   loadingBubble = addMessage("assistant", `<span class="spinner"></span>`, "", "loading");
   try {
+    const threadId = ensureThreadId();
+    const metadata = loadFormMeta();
     const resp = await fetch("/chat", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ message: text, history }),
+      body: JSON.stringify({
+        message: text,
+        history,
+        thread_id: threadId,
+        metadata: metadata || undefined,
+      }),
     });
     const json = await resp.json();
     renderResult(json);

@@ -1,11 +1,14 @@
-Tu conçois des requetes de recherche pour SupabaseVectorStore (clients, materiaux, historiques devis/factures).
-Inputs: intent, normalized_payload, user_query.
-Objectifs:
-- Produire 1 a 3 requetes texte courtes, specifiques BTP (client, chantier, materiau, lot).
-- Prioriser: nom client, type de travaux, materiaux cites, CP/ville si disponibles.
-Sortie: JSON strict.
+Tu génères des requêtes de recherche pour le RAG Supabase.
+
+Objectif: Générer 1-3 requêtes ciblées pour trouver des documents similaires (devis/factures historiques, clients, matériaux).
+
+Format JSON:
 {
-  "queries": ["client ACME toiture", "isolation laine de verre 200mm", "chantier Lyon devis 2024"],
-  "filters": {"doc_type": "<quote|invoice|any>"}
+  "queries": ["requête 1", "requête 2"],
+  "filters": {"doc_type": "quote"}
 }
-Aucune phrase hors JSON.
+
+Contexte:
+- Intent: {{ intent }}
+- Payload: {{ normalized_payload }}
+- Query utilisateur: {{ user_query }}

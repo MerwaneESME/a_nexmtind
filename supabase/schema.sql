@@ -13,10 +13,20 @@ create table public.clients (
 
 create table public.profiles (
   id uuid primary key,
+  email text,
   full_name text,
-  company text,
-  role text,
+  phone text,
+  company_name text,
+  siret text,
+  user_type text,
+  avatar_url text,
+  address text,
+  city text,
+  postal_code text,
+  company_description text,
+  company_website text,
   created_at timestamptz default now(),
+  updated_at timestamptz default now(),
   constraint profiles_id_fkey foreign key (id) references auth.users (id)
 );
 
@@ -73,20 +83,24 @@ create table public.facture_items (
   total numeric not null
 );
 
-create table public.conversations (
-  id uuid primary key default gen_random_uuid(),
-  user_id uuid references public.profiles (id),
-  client_id uuid references public.clients (id),
-  messages jsonb,
-  created_at timestamptz default now()
-);
-
 create table public.embeddings (
   id uuid primary key default gen_random_uuid(),
   source_table text,
   source_id uuid,
   embedding vector,
   text_excerpt text,
+  created_at timestamptz default now()
+);
+
+create table public.notifications (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid references public.profiles (id) on delete cascade,
+  title text not null,
+  description text,
+  type text not null default 'info',
+  action_url text,
+  data jsonb default '{}'::jsonb,
+  read_at timestamptz,
   created_at timestamptz default now()
 );
 

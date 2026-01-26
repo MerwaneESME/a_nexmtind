@@ -1,3 +1,4 @@
+"""Configuration et modèles de données pour l'agent BTP V2."""
 import os
 import re
 from datetime import date
@@ -14,13 +15,12 @@ SIRET_RE = re.compile(r"\b\d{14}\b")
 SIREN_RE = re.compile(r"\b\d{9}\b")
 TVA_FR_RE = re.compile(r"^FR[0-9A-Z]{0,2}\d{9}$")
 
-DEFAULT_MODEL = os.getenv("LLM_MODEL", "gpt-4o-mini")
-FALLBACK_MODEL = os.getenv("LLM_FALLBACK_MODEL", "gpt-4o")
-
+DEFAULT_MODEL = os.getenv("LLM_MODEL", "gpt-5-mini")
+FALLBACK_MODEL = os.getenv("LLM_FALLBACK_MODEL", "gpt-4o-mini")
 
 SYSTEM_PROMPT = """
-Tu es un agent IA specialise dans le BTP. Tu analyses, prepares et valides des devis/factures en garantissant la conformite metier (TVA, penalites, mentions obligatoires) et l'integration Supabase.
-Respecte toujours le schema JSON attendu et garde les reponses concises, actionnables et orientees correction.
+Tu es un agent IA spécialisé dans le BTP. Tu analyses, prépares et valides des devis/factures en garantissant la conformité métier (TVA, pénalités, mentions obligatoires) et l'intégration Supabase.
+Respecte toujours le schéma JSON attendu et garde les réponses concises, actionnables et orientées correction.
 """.strip()
 
 
@@ -113,20 +113,15 @@ class InvoiceSchema(QuoteSchema):
     amount_paid: Optional[Decimal] = Decimal(0)
 
 
-def get_llm(model: str | None = None):
-    """Retourne le modele principal avec fallback automatique."""
-    primary = ChatOpenAI(model=model or DEFAULT_MODEL, temperature=0)
-    fallback = ChatOpenAI(model=FALLBACK_MODEL, temperature=0)
+def get_llm(model: str | None = None, temperature: float = 0):
+    """Retourne le modèle principal avec fallback automatique."""
+    primary = ChatOpenAI(model=model or DEFAULT_MODEL, temperature=temperature)
+    fallback = ChatOpenAI(model=FALLBACK_MODEL, temperature=temperature)
     return primary.with_fallbacks([fallback])
 
 
-def llm(model: str | None = None):
-    """Alias retrocompatible."""
-    return get_llm(model)
-
-
 def get_embeddings():
-    """Selectionne OpenAI embeddings par defaut, Mistral si configure."""
+    """Sélectionne OpenAI embeddings par défaut, Mistral si configuré."""
     try:
         from langchain_mistralai import MistralAIEmbeddings  # type: ignore
     except Exception:

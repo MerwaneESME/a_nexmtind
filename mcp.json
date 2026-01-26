@@ -1,0 +1,10 @@
+﻿{
+  "servers": {
+    "supabase": {
+      "url": "https://mcp.supabase.com/mcp?project_ref=qdaismrdwdffdgdhgyuq",
+      "headers": {
+        "Authorization": "Bearer ${SUPABASE_ACCESS_TOKEN}"
+      }
+    }
+  }
+}

@@ -1,5 +1,6 @@
+"""RAG avec SupabaseVectorStore."""
 import os
-from typing import Any, List, Optional
+from typing import List, Optional
 
 from langchain_community.vectorstores import SupabaseVectorStore
 from langchain_core.documents import Document
@@ -9,7 +10,7 @@ from .supabase_client import get_client
 
 
 class SupabaseRAG:
-    """Wrapper simple autour de SupabaseVectorStore pour le RAG."""
+    """Wrapper autour de SupabaseVectorStore pour le RAG."""
 
     def __init__(self, table_name: Optional[str] = None, query_name: Optional[str] = None, k: int = 5, threshold: float = 0.75):
         self.table_name = table_name or os.getenv("SUPABASE_VECTOR_TABLE", "documents")
@@ -37,11 +38,7 @@ class SupabaseRAG:
         return self._store is not None
 
     def retrieve(self, query: str) -> List[dict]:
-        """
-        Récupère les documents les plus similaires depuis SupabaseVectorStore.
-        Le score est une similarité cosinus (0-1), où 1 = identique, 0 = différent.
-        Seuil par défaut: 0.75 (documents très similaires uniquement).
-        """
+        """Récupère les documents les plus similaires depuis SupabaseVectorStore."""
         if not query or not self._store:
             return []
         try:
@@ -51,8 +48,6 @@ class SupabaseRAG:
 
         results: List[dict] = []
         for doc, score in docs_scores:
-            # Score de similarité cosinus: plus élevé = plus similaire
-            # On garde seulement les documents avec score >= threshold (très similaires)
             keep = score is None or score >= self.threshold
             if not keep:
                 continue
@@ -65,18 +60,3 @@ class SupabaseRAG:
                     }
                 )
         return results
-
-
-def match_chunks(chunks: List[dict], max_chars: int = 1200) -> str:
-    """Assemble des chunks en respectant une longueur maximale."""
-    acc: List[str] = []
-    total_len = 0
-    for chunk in chunks:
-        text = chunk.get("content") or ""
-        if not text:
-            continue
-        if total_len + len(text) > max_chars:
-            break
-        acc.append(text)
-        total_len += len(text)
-    return "\n\n".join(acc)
