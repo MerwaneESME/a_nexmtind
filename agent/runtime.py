@@ -362,7 +362,15 @@ def agent_reasoning_node(state: AgentState) -> AgentState:
     corrections = state.get("corrections") or []
     missing_fields = state.get("missing_fields") or []
     
+    # ✅ Récupérer les messages précédents pour conserver l'historique
+    previous_messages = state.get("messages", [])
+    
     # Construire le contexte pour le LLM
+    last_user_msg = ""
+    if previous_messages:
+        last_msg = previous_messages[-1]
+        last_user_msg = last_msg.content if hasattr(last_msg, "content") else str(last_msg)
+    
     reasoning_prompt = f"""
 Tu es un agent BTP spécialisé dans les devis/factures.
 
@@ -379,26 +387,38 @@ Instructions:
 3. Si des lignes sont présentes, tu peux appeler calculate_totals_tool pour calculer les totaux
 4. Réponds de manière conversationnelle et actionnable
 
-Message utilisateur: {state.get("messages", [])[-1].content if state.get("messages") else ""}
+Message utilisateur: {last_user_msg}
 """
     
     # ✅ Donner les outils au LLM pour qu'il décide
     llm_with_tools = get_llm().bind_tools(AVAILABLE_TOOLS)
     
-    messages = [
-        SystemMessage(content=SYSTEM_PROMPT),
-        HumanMessage(content=reasoning_prompt),
-    ]
+    # ✅ Construire les messages avec l'historique
+    messages = list(previous_messages)
     
-    result = llm_with_tools.invoke(messages)
+    # Ajouter le system prompt si pas déjà présent
+    has_system = any(isinstance(m, SystemMessage) for m in messages)
+    if not has_system:
+        messages.insert(0, SystemMessage(content=SYSTEM_PROMPT))
+    
+    # Ajouter le nouveau message de raisonnement
+    messages.append(HumanMessage(content=reasoning_prompt))
+    
+    try:
+        result = llm_with_tools.invoke(messages)
+    except Exception as exc:
+        logger.error("Erreur dans agent_reasoning_node: %s", exc, exc_info=True)
+        # Fallback : créer un message sans tool calls
+        result = AIMessage(content="Erreur lors du traitement de la requête.")
     
     # Vérifier si le LLM a appelé des outils
     tool_calls = []
     if hasattr(result, "tool_calls") and result.tool_calls:
         tool_calls = result.tool_calls
     
+    # ✅ TOUJOURS ajouter le message (même sans tool_calls) pour conserver l'historique
     return {
-        "messages": [result] if tool_calls else [],
+        "messages": [result],
         "tool_calls": tool_calls,
     }
 
@@ -418,6 +438,9 @@ def llm_synthesizer_node(state: AgentState) -> AgentState:
     validate_section = state.get("validate_section") or ""
     rag_context = state.get("rag_context") or []
     supabase_context = state.get("supabase_context") or []
+    
+    # ✅ Récupérer TOUS les messages (y compris ToolMessages des outils exécutés)
+    all_messages = state.get("messages", [])
 
     # Choisir le bon prompt selon l'intent
     if intent == "validate":
@@ -479,12 +502,25 @@ INSTRUCTIONS:
 3. Si une donnee manque, mets null ET ajoute-la a missing_fields
 """
     try:
-        messages = prompt.format_messages(**prompt_context)
-    except Exception:
-        messages = [HumanMessage(content=state.get("messages", [])[-1].content if state.get("messages") else "")]
-    messages.insert(0, SystemMessage(content=system_instruction))
+        # ✅ Utiliser les messages formatés du prompt
+        formatted_messages = prompt.format_messages(**prompt_context)
+        # ✅ Construire la liste complète avec l'historique + nouveaux messages
+        messages_for_llm = list(all_messages)  # Historique complet (y compris ToolMessages)
+        messages_for_llm.extend(formatted_messages)  # Ajouter les messages formatés
+        messages_for_llm.insert(0, SystemMessage(content=system_instruction))
+    except Exception as exc:
+        logger.error("Erreur dans llm_synthesizer_node (format_messages): %s", exc, exc_info=True)
+        # Fallback : utiliser les messages existants
+        messages_for_llm = list(all_messages) if all_messages else [HumanMessage(content=state.get("messages", [])[-1].content if state.get("messages") else "")]
+        messages_for_llm.insert(0, SystemMessage(content=system_instruction))
     
-    result = get_llm().invoke(messages)
+    try:
+        result = get_llm().invoke(messages_for_llm)
+    except Exception as exc:
+        logger.error("Erreur dans llm_synthesizer_node (invoke): %s", exc, exc_info=True)
+        # Fallback : créer un message d'erreur
+        result = AIMessage(content="Erreur lors de la génération de la réponse.")
+    
     content = getattr(result, "content", None) or str(result)
     parsed = _maybe_parse_json(content)
 
@@ -532,8 +568,11 @@ INSTRUCTIONS:
                 if "a corriger" not in str(parsed.get("reply", "")).lower():
                     parsed["reply"] = "A corriger"
 
+    # ✅ Ajouter le nouveau message à l'historique
+    new_ai_message = AIMessage(content=content)
+    
     return {
-        "messages": [AIMessage(content=content)],
+        "messages": [new_ai_message],  # Le state gère l'accumulation via add_messages
         "output": parsed or content,
         "missing_fields": missing_fields,
         "corrections": corrections,
@@ -614,14 +653,28 @@ def invoke_agent(state: Dict[str, Any], thread_id: str = "default"):
     """Helper pour invoquer le graph avec mémoire LangGraph."""
     state_input: AgentState = dict(state)
     msgs = state_input.get("messages", [])
+    
+    # Si pas de messages mais un input textuel, créer un HumanMessage
     if not msgs and state_input.get("input"):
         msgs = [HumanMessage(content=state_input["input"])]
     
-    # Injecter system prompt si absent
+    # Injecter system prompt si absent (mais ne pas écraser l'historique)
     has_system = any(isinstance(m, SystemMessage) or getattr(m, "role", "") == "system" for m in msgs)
-    if not has_system:
+    if not has_system and msgs:
+        # Insérer au début sans écraser
         msgs = [SystemMessage(content=SYSTEM_PROMPT)] + msgs
     
     state_input["messages"] = msgs
     
-    return agent_graph.invoke(state_input, config={"configurable": {"thread_id": thread_id}})
+    try:
+        # ✅ Le checkpointer LangGraph gère automatiquement l'historique via thread_id
+        config = {"configurable": {"thread_id": thread_id}}
+        result = agent_graph.invoke(state_input, config=config)
+        return result
+    except Exception as exc:
+        logger.error("Erreur dans invoke_agent: %s", exc, exc_info=True)
+        # Retourner un state minimal en cas d'erreur
+        return {
+            "output": {"error": str(exc), "reply": "Erreur lors du traitement de la requête."},
+            "messages": msgs,
+        }

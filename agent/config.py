@@ -17,6 +17,8 @@ TVA_FR_RE = re.compile(r"^FR[0-9A-Z]{0,2}\d{9}$")
 
 DEFAULT_MODEL = os.getenv("LLM_MODEL", "gpt-5-mini")
 FALLBACK_MODEL = os.getenv("LLM_FALLBACK_MODEL", "gpt-4o-mini")
+FAST_MODEL = os.getenv("LLM_FAST_MODEL", "gpt-5-nano")
+FAST_FALLBACK_MODEL = os.getenv("LLM_FAST_FALLBACK_MODEL", FALLBACK_MODEL)
 
 SYSTEM_PROMPT = """
 Tu es un agent IA spécialisé dans le BTP. Tu analyses, prépares et valides des devis/factures en garantissant la conformité métier (TVA, pénalités, mentions obligatoires) et l'intégration Supabase.
@@ -117,6 +119,13 @@ def get_llm(model: str | None = None, temperature: float = 0):
     """Retourne le modèle principal avec fallback automatique."""
     primary = ChatOpenAI(model=model or DEFAULT_MODEL, temperature=temperature)
     fallback = ChatOpenAI(model=FALLBACK_MODEL, temperature=temperature)
+    return primary.with_fallbacks([fallback])
+
+
+def get_fast_llm(temperature: float = 0):
+    """Small/fast model for quick answers and routing (no extra context/tools)."""
+    primary = ChatOpenAI(model=FAST_MODEL, temperature=temperature)
+    fallback = ChatOpenAI(model=FAST_FALLBACK_MODEL, temperature=temperature)
     return primary.with_fallbacks([fallback])
 
 

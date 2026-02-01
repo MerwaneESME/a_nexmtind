@@ -15,7 +15,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from pydantic import BaseModel, Field, validator
 
 from .runtime import invoke_agent
-from .config import get_llm
+from .config import get_fast_llm, get_llm
 from .supabase_client import get_client, upsert_document
 from .tools import calculate_totals_tool, clean_lines_tool, supabase_lookup_tool, validate_devis_tool
 from .logging_config import logger
@@ -164,6 +164,24 @@ def _format_ai_reply(reply: Any) -> str:
         return str(reply)
 
 
+def _client_fast_reply(message: str) -> str | None:
+    """Réponse rapide conseiller (client), sans accès Supabase."""
+    system_prompt = (
+        "Tu es un conseiller BTP pour un particulier. "
+        "Réponds en français, en 2-3 phrases maximum, avec des mots simples. "
+        "Si on te demande des étapes, donne 3 étapes courtes. "
+        "Si on te demande d'expliquer un terme, donne une définition simple et un exemple concret. "
+        "Ne pose pas de question."
+    )
+    try:
+        llm = get_fast_llm()
+        result = llm.invoke([SystemMessage(content=system_prompt), HumanMessage(content=message)])
+        return _format_ai_reply(getattr(result, "content", None) or str(result)).strip() or None
+    except Exception as exc:
+        logger.warning("Client fast reply failed: %s", exc)
+        return None
+
+
 # ==================== ModÃ¨les Pydantic ====================
 
 class ChatHistoryItem(BaseModel):
@@ -185,6 +203,7 @@ class ProjectChatInput(BaseModel):
     message: str
     history: Optional[List[ChatHistoryItem]] = None
     force_plan: Optional[bool] = None
+    user_role: Optional[str] = None
 
 
 class ProSearchInput(BaseModel):
@@ -679,40 +698,46 @@ async def project_chat(payload: ProjectChatInput):
     devis_items_count = len(context.get("devis_items") or [])
     has_devis = devis_count > 0 and devis_items_count > 0
 
-    if not has_devis:
-        return JSONResponse({
-            "reply": "Je peux vous aider a planifier le projet, mais j'ai besoin d'un devis lie au projet pour analyser les travaux. Ajoutez un devis puis relancez-moi.",
-            "proposal": None,
-            "requires_devis": True,
-        })
-
     now = datetime.now().astimezone()
     now_label = now.strftime("%Y-%m-%d %H:%M")
     tz_label = now.tzname() or "local"
 
-    system_prompt = """
-Tu es un assistant BTP pour la gestion de projet.
+    persona = (
+        "Tu es un conseiller BTP pour un particulier. Explique simplement, rassure, evite le jargon, "
+        "et propose des options concretes."
+        if (payload.user_role or "").lower() in {"particulier", "client"}
+        else "Tu es un assistant BTP pour un professionnel. Va a l essentiel et propose des actions claires."
+    )
+
+    system_prompt = f"""
+{persona}
 Regles:
 - Utilise uniquement le contexte fourni (projet, devis, messages, participants, taches).
 - Ne parle jamais d'un autre projet.
 - Propose un planning uniquement si l'utilisateur le demande ou si force_plan est vrai.
+- has_devis={has_devis}. Si has_devis=True, ne demande pas d'ajouter un devis. Si has_devis=False, tu peux demander un devis mais une seule fois.
 - Reponds en JSON strict avec les cles: reply, proposal, requires_devis.
-- proposal est null ou { "summary": "...", "tasks": [ { "name": "", "description": "", "start_date": "YYYY-MM-DD", "end_date": "YYYY-MM-DD", "time_range": "HH:MM-HH:MM" } ] }.
+- proposal est null ou {{ "summary": "...", "tasks": [ {{ "name": "", "description": "", "start_date": "YYYY-MM-DD", "end_date": "YYYY-MM-DD", "time_range": "HH:MM-HH:MM" }} ] }}.
 - Le planning ne doit pas commencer avant la date/heure actuelles.
-- Si une tache est prevue aujourd hui, son heure de debut doit etre apres l heure actuelle, sinon decale au lendemain.
+- Si une tache est prevue aujourd'hui, son heure de debut doit etre apres l'heure actuelle, sinon decale au lendemain.
 Style de reponse:
 - Format conseille: 1 phrase de resume + 3 puces maximum.
 - Reponds en francais clair, concis (max 8 lignes).
-- Utilise les accents et apostrophes correctes.
-- Ne renvoie jamais d identifiants internes ou de JSON dans reply.
-- Si l utilisateur demande un autre projet, propose d ouvrir l autre projet ou d en creer un nouveau.
+- Ne renvoie jamais d'identifiants internes ou de JSON dans reply.
+- Si l'utilisateur demande un autre projet, propose d'ouvrir l'autre projet ou d'en creer un nouveau.
+- Si la derniere reponse assistant est similaire a ce que tu allais dire, reformule en apportant une nouvelle information/action.
 """
     context_summary = _format_project_context(context)
 
     history_lines = []
+    last_assistant = ""
     if payload.history:
         for item in payload.history[-6:]:
             history_lines.append(f"{item.role}: {item.content}")
+        for item in reversed(payload.history):
+            if item.role == "assistant":
+                last_assistant = item.content
+                break
 
     user_block = f"""
 Contexte:
@@ -723,6 +748,8 @@ Date/heure actuelles:
 
 Historique recent:
 {chr(10).join(history_lines)}
+Derniere reponse assistant:
+{last_assistant}
 
 Message utilisateur:
 {payload.message}
@@ -747,12 +774,42 @@ force_plan: {bool(payload.force_plan)}
 
     parsed.setdefault("reply", "Je peux proposer un planning base sur le devis.")
     parsed.setdefault("proposal", None)
-    parsed.setdefault("requires_devis", False)
+    parsed["requires_devis"] = False if has_devis else parsed.get("requires_devis", True)
 
     if isinstance(parsed.get("proposal"), dict):
         parsed["proposal"] = _apply_planning_guardrails(parsed["proposal"], now)
 
+    # Anti-repetition et ajustement pour les particuliers
+    reply_text = parsed.get("reply", "")
+    if has_devis and "devis" in reply_text.lower() and ("ajout" in reply_text.lower() or "lier" in reply_text.lower()):
+        reply_text = "Le devis est deja lie au projet. Je peux analyser son contenu et proposer les prochaines etapes ou repondre a vos questions."
+    if last_assistant and reply_text.strip().lower() == last_assistant.strip().lower():
+        reply_text = reply_text + " Je peux aussi vous donner un resume rapide du projet ou des prochaines etapes, dites-moi ce que vous preferez."
+
+    parsed["reply"] = reply_text
+
     return JSONResponse(parsed)
+
+
+@app.post("/project-chat-client")
+async def project_chat_client(payload: ProjectChatInput):
+    """Chat IA dédié aux particuliers (conseiller)."""
+    # Fast answer sans données
+    fast = _client_fast_reply(payload.message)
+    keywords = ["projet", "planning", "tache", "tâche", "devis", "budget", "avancement", "membre", "message"]
+    needs_data = any(k in (payload.message or "").lower() for k in keywords)
+
+    if fast and not needs_data:
+        return JSONResponse({
+            "reply": fast,
+            "proposal": None,
+            "requires_devis": False,
+            "orchestrator": {"action": "answer", "needs_data": False, "reason": "client_fast"},
+        })
+
+    # Sinon on délègue au flux projet avec ton conseiller (user_role=particulier)
+    payload.user_role = "particulier"
+    return await project_chat(payload)
 
 
 @app.post("/pro-search")
@@ -1008,11 +1065,6 @@ async def prepare_devis(payload: PrepareDevisPayload):
 async def health():
     """Health check."""
     return {"status": "ok", "version": "2.0"}
-
-
-
-
-
 
 
 
