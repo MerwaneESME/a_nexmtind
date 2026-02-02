@@ -10,7 +10,7 @@ from langgraph.graph import END, StateGraph
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode
 
-from .config import SYSTEM_PROMPT, get_llm
+from .config import SYSTEM_PROMPT, get_llm, get_fast_llm
 from .logging_config import logger
 from .rag import SupabaseRAG
 from .tools import AVAILABLE_TOOLS, calculate_totals_tool, clean_lines_tool, validate_devis_tool
@@ -73,6 +73,70 @@ class AgentState(TypedDict, total=False):
 rag_client = SupabaseRAG()
 
 
+# ==================== Nœud 0: Fast Path pour Questions Simples ====================
+
+def fast_path_node(state: AgentState) -> AgentState:
+    """Détecte les questions simples et répond directement avec fast_llm."""
+    messages = state.get("messages", [])
+    if not messages:
+        return {}
+    
+    last_msg = messages[-1]
+    content = last_msg.content if hasattr(last_msg, "content") else str(last_msg)
+    content_lower = content.lower().strip()
+    
+    # Questions simples qui ne nécessitent pas le workflow complet
+    simple_questions = [
+        "que sais-tu faire",
+        "que peux-tu faire",
+        "aide",
+        "help",
+        "bonjour",
+        "salut",
+        "hello",
+        "qui es-tu",
+        "présente-toi",
+        "qu'est-ce que tu fais",
+        "comment ça marche",
+        "que fais-tu",
+    ]
+    
+    # Vérifier si c'est une question simple
+    is_simple = any(q in content_lower for q in simple_questions)
+    
+    # Vérifier aussi s'il n'y a pas de métadonnées structurées
+    has_structured_data = bool(state.get("normalized", {}).get("structured_payload"))
+    has_metadata = bool(state.get("metadata"))
+    
+    if is_simple and not has_structured_data and not has_metadata:
+        # Réponse rapide avec fast_llm
+        system_prompt = """Tu es un assistant BTP spécialisé dans les devis et factures.
+Réponds brièvement (2-3 phrases max) en français, de manière conversationnelle et amicale.
+Si on te demande ce que tu sais faire, liste 3-4 capacités principales."""
+        
+        try:
+            llm = get_fast_llm()
+            result = llm.invoke([
+                SystemMessage(content=system_prompt),
+                HumanMessage(content=content)
+            ])
+            reply = getattr(result, "content", None) or str(result)
+            
+            return {
+                "output": {
+                    "reply": reply.strip(),
+                    "todo": []
+                },
+                "messages": [AIMessage(content=reply)],
+                "fast_path_used": True,  # Flag pour skip le reste
+            }
+        except Exception as exc:
+            logger.error("Fast path failed: %s", exc, exc_info=True)
+            # Continuer avec le workflow normal
+    
+    return {}  # Pas une question simple, continuer normalement
+
+
 def _build_prompt(name: str) -> ChatPromptTemplate:
     content = _read_prompt(name)
     if not content:
@@ -113,7 +177,61 @@ def input_normalizer_node(state: AgentState) -> AgentState:
             "files": state.get("files", []),
         }
 
-    # Sinon, utiliser le prompt d'analyse
+    # ✅ Détection rapide par keywords pour éviter l'appel LLM
+    msg_lower = last_user_msg.lower()
+    
+    # Intent "chat" évident (questions générales)
+    if any(kw in msg_lower for kw in ["bonjour", "salut", "hello", "aide", "help", "que sais", "que peux", "qui es", "présente"]):
+        normalized = {
+            "intent": "chat",
+            "doc_type": "quote",
+            "structured_payload": {},
+            "summary": last_user_msg[:280],
+            "line_items": [],
+            "files": [],
+            "missing_fields": [],
+        }
+        return {
+            "intent": "chat",
+            "normalized": normalized,
+            "files": state.get("files", []),
+        }
+    
+    # Intent "prepare_devis" évident
+    if any(kw in msg_lower for kw in ["devis", "facture", "quote", "invoice", "créer un devis", "faire un devis"]):
+        normalized = {
+            "intent": "prepare_devis",
+            "doc_type": "invoice" if "facture" in msg_lower else "quote",
+            "structured_payload": {},
+            "summary": last_user_msg[:280],
+            "line_items": [],
+            "files": [],
+            "missing_fields": [],
+        }
+        return {
+            "intent": "prepare_devis",
+            "normalized": normalized,
+            "files": state.get("files", []),
+        }
+    
+    # Intent "validate" évident
+    if any(kw in msg_lower for kw in ["valide", "validation", "vérifie", "corrige", "check"]):
+        normalized = {
+            "intent": "validate",
+            "doc_type": "quote",
+            "structured_payload": {},
+            "summary": last_user_msg[:280],
+            "line_items": [],
+            "files": [],
+            "missing_fields": [],
+        }
+        return {
+            "intent": "validate",
+            "normalized": normalized,
+            "files": state.get("files", []),
+        }
+
+    # Sinon, utiliser le prompt d'analyse (appel LLM)
     prompt = _build_prompt("analysis_prompt")
     try:
         formatted = prompt.format_messages(
@@ -124,7 +242,8 @@ def input_normalizer_node(state: AgentState) -> AgentState:
         content = getattr(reply, "content", None) or str(reply)
         parsed = _maybe_parse_json(content) or {}
         normalized = parsed if isinstance(parsed, dict) else {}
-    except Exception:
+    except Exception as exc:
+        logger.error("Erreur dans input_normalizer_node (LLM): %s", exc, exc_info=True)
         # Fallback si le prompt ne peut pas etre formate
         normalized = {
             "intent": "chat",
@@ -152,16 +271,25 @@ def input_normalizer_node(state: AgentState) -> AgentState:
 
 def rag_retriever_node(state: AgentState) -> AgentState:
     """Récupère du contexte RAG depuis SupabaseVectorStore."""
+    intent = state.get("intent") or (state.get("normalized") or {}).get("intent") or "chat"
     normalized = state.get("normalized") or {}
     payload = normalized.get("structured_payload", {})
+    
+    # ✅ Skip RAG pour questions simples sans données structurées
+    if intent == "chat" and not payload:
+        return {
+            "rag_context": [],
+            "supabase_context": [],
+        }
+    
     query = normalized.get("summary") or payload.get("project_label") or payload.get("notes") or ""
     
     rag_results = []
     if query and rag_client.is_ready():
         try:
             rag_results = rag_client.retrieve(query)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("RAG retrieval failed: %s", exc)
 
     return {
         "rag_context": rag_results,
@@ -178,7 +306,17 @@ def business_tools_node(state: AgentState) -> AgentState:
     payload = dict(normalized.get("structured_payload") or {})
     validate_section = (state.get("validate_section") or "").lower()
 
-    # ✅ TOUJOURS traiter les données si présentes, même en mode chat
+    # ✅ Skip si pas de données structurées ET intent simple (pas besoin de calculs)
+    if intent == "chat" and not payload:
+        return {
+            "tool_results": {},
+            "totals": {},
+            "corrections": [],
+            "missing_fields": [],
+            "section_issues": [],
+        }
+
+    # ✅ Traiter les données si présentes
     if payload:
         line_items = payload.get("line_items") or []
         
@@ -607,10 +745,11 @@ def should_continue(state: AgentState) -> str:
 # ==================== Construction du Graph ====================
 
 def build_graph():
-    """Construit le graph LangGraph avec function calling."""
+    """Construit le graph LangGraph avec function calling et fast path."""
     builder = StateGraph(AgentState)
     
     # Ajouter les nœuds
+    builder.add_node("fast_path", fast_path_node)  # ✅ Fast path en premier
     builder.add_node("input_normalizer", input_normalizer_node)
     builder.add_node("rag_retriever", rag_retriever_node)
     builder.add_node("business_tools", business_tools_node)
@@ -619,8 +758,18 @@ def build_graph():
     builder.add_node("llm_synthesizer", llm_synthesizer_node)
     builder.add_node("reflection", reflection_node)
     
-    # Définir le flux
-    builder.set_entry_point("input_normalizer")
+    # ✅ Fast path en premier - si réponse rapide, skip le reste
+    builder.set_entry_point("fast_path")
+    builder.add_conditional_edges(
+        "fast_path",
+        lambda state: "end" if state.get("fast_path_used") else "input_normalizer",
+        {
+            "end": END,
+            "input_normalizer": "input_normalizer"
+        }
+    )
+    
+    # Définir le flux normal
     builder.add_edge("input_normalizer", "rag_retriever")
     builder.add_edge("rag_retriever", "business_tools")
     builder.add_edge("business_tools", "agent_reasoning")
