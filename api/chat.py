@@ -16,8 +16,9 @@ from pydantic import BaseModel
 
 from agent.cache import CacheEntry, get_chat_cache, normalize_question
 from agent.fast_path import try_fast_path
-from agent.graph import prepare_state, stream_synthesize, synthesize
+from agent.graph import generate_response_with_actions, prepare_state, stream_synthesize, synthesize
 from agent.logging_config import logger
+from agent.utils.conversation_store import get_conversation_store
 
 
 router = APIRouter()
@@ -31,11 +32,13 @@ class ChatHistoryItem(BaseModel):
 class ChatInput(BaseModel):
     message: str
     thread_id: Optional[str] = None
+    conversation_id: Optional[str] = None
     history: Optional[List[ChatHistoryItem]] = None
     metadata: Optional[Dict[str, Any]] = None
     force_prepare: Optional[bool] = None
     stream: Optional[bool] = None
     clear_cache: Optional[bool] = None
+    clear_history: Optional[bool] = None
 
 
 def _wants_stream(payload: ChatInput, request: Request) -> bool:
@@ -96,11 +99,69 @@ def _tool_to_response_extras(state: dict[str, Any]) -> tuple[dict, list, dict]:
     return tool_result or {}, corrections, totals
 
 
+def _is_context_dependent(query: str, history: list[dict[str, Any]]) -> bool:
+    if not history:
+        return False
+
+    q = (query or "").strip().lower()
+    if not q:
+        return False
+
+    context_keywords = (
+        "aussi",
+        "et",
+        "en plus",
+        "pareil",
+        "même chose",
+        "meme chose",
+        "combien en tout",
+        "total",
+        "au final",
+        "pour ça",
+        "pour ca",
+        "pour cela",
+        "dans ce cas",
+        "et pour",
+        "et du coup",
+        "pour le plafond",
+        "pour le mur",
+        "pour la toiture",
+        "il",
+        "elle",
+        "ça",
+        "ca",
+        "cela",
+        "eux",
+    )
+
+    # Questions courtes + pronoms / références => probablement contextuelles
+    if len(q) < 40 and any(k in q for k in context_keywords):
+        return True
+
+    # "Et pour X ?" / "Et X ?" => contextuel si on a déjà une discussion
+    if q.startswith("et ") or q.startswith("et pour"):
+        return True
+
+    return False
+
+
 async def handle_chat_non_stream(payload: ChatInput) -> dict[str, Any]:
     cache = get_chat_cache()
     normalized = normalize_question(payload.message)
+    store = get_conversation_store()
+    conversation_id = (payload.conversation_id or payload.thread_id or "").strip() or None
+
+    if store.enabled and conversation_id and payload.clear_history is True:
+        await store.clear_history(conversation_id=conversation_id)
+
     history_dump = [item.model_dump() for item in (payload.history or [])]
-    cacheable = _is_cacheable(payload.metadata, history_dump)
+    stored_history: list[dict[str, Any]] = []
+    if store.enabled and conversation_id and not history_dump:
+        stored_history = await store.get_history(conversation_id=conversation_id, limit=10)
+        if _is_context_dependent(payload.message, stored_history):
+            history_dump = [{"role": m.get("role", ""), "content": m.get("content", "")} for m in stored_history]
+
+    cacheable = _is_cacheable(payload.metadata, history_dump) and not bool(stored_history)
     # Clear cache for this question when requested (dev/test).
     # Note: we still allow caching of the fresh response afterward.
     if cache.enabled and cacheable and payload.clear_cache is True:
@@ -110,8 +171,11 @@ async def handle_chat_non_stream(payload: ChatInput) -> dict[str, Any]:
         hit = await cache.get(normalized)
         if hit:
             meta = hit.meta or {}
+            enriched = generate_response_with_actions(query=payload.message, response_text=hit.reply, metadata={"route": meta.get("route") or "cache"})
             return {
-                "reply": hit.reply,
+                "reply": enriched["response"],
+                "quick_actions": enriched["quick_actions"],
+                "conversation_id": conversation_id,
                 "raw_output": {"cache": "hit", "route": meta.get("route")},
                 "corrections": [],
                 "totals": {},
@@ -133,8 +197,19 @@ async def handle_chat_non_stream(payload: ChatInput) -> dict[str, Any]:
         logger.info("=" * 80)
         if cache.enabled and cacheable:
             await cache.set(normalized, CacheEntry(reply=fast, meta={"route": "fast"}))
+        enriched = generate_response_with_actions(query=payload.message, response_text=fast, metadata={"route": "fast"})
+        if store.enabled and conversation_id:
+            await store.add_message(conversation_id=conversation_id, role="user", content=payload.message, metadata={})
+            await store.add_message(
+                conversation_id=conversation_id,
+                role="assistant",
+                content=enriched["response"],
+                metadata={"route": "fast", "quick_actions": enriched["quick_actions"]},
+            )
         return {
-            "reply": fast,
+            "reply": enriched["response"],
+            "quick_actions": enriched["quick_actions"],
+            "conversation_id": conversation_id,
             "raw_output": {"route": "fast"},
             "corrections": [],
             "totals": {},
@@ -148,6 +223,16 @@ async def handle_chat_non_stream(payload: ChatInput) -> dict[str, Any]:
     )
     reply = await synthesize(state)
     tool_result, corrections, totals = _tool_to_response_extras(state)
+    enriched = generate_response_with_actions(
+        query=payload.message,
+        response_text=reply,
+        metadata={
+            "route": "full",
+            "rag_used": bool(state.get("rag_context")),
+            "tool_used": (state.get("tool_call") or {}).get("name") if isinstance(state.get("tool_call"), dict) else None,
+            "intent": state.get("intent"),
+        },
+    )
 
     logger.info("=" * 80)
     logger.info("🔍 ROUTING DECISION | route=full | clear_cache=%s", bool(payload.clear_cache))
@@ -158,8 +243,24 @@ async def handle_chat_non_stream(payload: ChatInput) -> dict[str, Any]:
     if cache.enabled and cacheable and reply:
         await cache.set(normalized, CacheEntry(reply=reply, meta={"route": "full"}))
 
+    if store.enabled and conversation_id:
+        await store.add_message(conversation_id=conversation_id, role="user", content=payload.message, metadata={})
+        await store.add_message(
+            conversation_id=conversation_id,
+            role="assistant",
+            content=enriched["response"],
+            metadata={
+                "route": "full",
+                "rag_used": bool(state.get("rag_context")),
+                "tool": state.get("tool_call"),
+                "quick_actions": enriched["quick_actions"],
+            },
+        )
+
     return {
-        "reply": reply,
+        "reply": enriched["response"],
+        "quick_actions": enriched["quick_actions"],
+        "conversation_id": conversation_id,
         "raw_output": {
             "route": "full",
             "intent": state.get("intent"),
@@ -176,8 +277,20 @@ async def handle_chat_non_stream(payload: ChatInput) -> dict[str, Any]:
 async def handle_chat_stream(payload: ChatInput) -> AsyncIterator[str]:
     cache = get_chat_cache()
     normalized = normalize_question(payload.message)
+    store = get_conversation_store()
+    conversation_id = (payload.conversation_id or payload.thread_id or "").strip() or None
+
+    if store.enabled and conversation_id and payload.clear_history is True:
+        await store.clear_history(conversation_id=conversation_id)
+
     history_dump = [item.model_dump() for item in (payload.history or [])]
-    cacheable = _is_cacheable(payload.metadata, history_dump)
+    stored_history: list[dict[str, Any]] = []
+    if store.enabled and conversation_id and not history_dump:
+        stored_history = await store.get_history(conversation_id=conversation_id, limit=10)
+        if _is_context_dependent(payload.message, stored_history):
+            history_dump = [{"role": m.get("role", ""), "content": m.get("content", "")} for m in stored_history]
+
+    cacheable = _is_cacheable(payload.metadata, history_dump) and not bool(stored_history)
 
     if cache.enabled and cacheable and payload.clear_cache is True:
         await cache.delete(normalized)
@@ -185,9 +298,13 @@ async def handle_chat_stream(payload: ChatInput) -> AsyncIterator[str]:
     if cache.enabled and cacheable:
         hit = await cache.get(normalized)
         if hit:
+            enriched = generate_response_with_actions(query=payload.message, response_text=hit.reply, metadata={"route": "cache"})
             yield _sse("meta", {"cache": "hit"})
-            yield _sse("delta", hit.reply)
-            yield _sse("done", {"reply": hit.reply})
+            yield _sse("delta", enriched["response"])
+            yield _sse(
+                "done",
+                {"reply": enriched["response"], "quick_actions": enriched["quick_actions"], "conversation_id": conversation_id},
+            )
             return
 
     user_role = str((payload.metadata or {}).get("user_role") or "")
@@ -205,9 +322,21 @@ async def handle_chat_stream(payload: ChatInput) -> AsyncIterator[str]:
         logger.info("=" * 80)
         if cache.enabled and cacheable:
             await cache.set(normalized, CacheEntry(reply=fast, meta={"route": "fast"}))
+        enriched = generate_response_with_actions(query=payload.message, response_text=fast, metadata={"route": "fast"})
         yield _sse("meta", {"cache": "miss", "route": "fast"})
-        yield _sse("delta", fast)
-        yield _sse("done", {"reply": fast})
+        yield _sse("delta", enriched["response"])
+        if store.enabled and conversation_id:
+            await store.add_message(conversation_id=conversation_id, role="user", content=payload.message, metadata={})
+            await store.add_message(
+                conversation_id=conversation_id,
+                role="assistant",
+                content=enriched["response"],
+                metadata={"route": "fast", "quick_actions": enriched["quick_actions"]},
+            )
+        yield _sse(
+            "done",
+            {"reply": enriched["response"], "quick_actions": enriched["quick_actions"], "conversation_id": conversation_id},
+        )
         return
 
     yield _sse("meta", {"cache": "miss", "route": "full"})
@@ -231,14 +360,40 @@ async def handle_chat_stream(payload: ChatInput) -> AsyncIterator[str]:
 
     reply = "".join(chunks).strip()
     tool_result, corrections, totals = _tool_to_response_extras(state)
+    enriched = generate_response_with_actions(
+        query=payload.message,
+        response_text=reply,
+        metadata={
+            "route": "full",
+            "rag_used": bool(state.get("rag_context")),
+            "tool_used": (state.get("tool_call") or {}).get("name") if isinstance(state.get("tool_call"), dict) else None,
+            "intent": state.get("intent"),
+        },
+    )
 
     if cache.enabled and cacheable and reply:
         await cache.set(normalized, CacheEntry(reply=reply, meta={"route": "full"}))
 
+    if store.enabled and conversation_id:
+        await store.add_message(conversation_id=conversation_id, role="user", content=payload.message, metadata={})
+        await store.add_message(
+            conversation_id=conversation_id,
+            role="assistant",
+            content=enriched["response"],
+            metadata={
+                "route": "full",
+                "rag_used": bool(state.get("rag_context")),
+                "tool": state.get("tool_call"),
+                "quick_actions": enriched["quick_actions"],
+            },
+        )
+
     yield _sse(
         "done",
         {
-            "reply": reply,
+            "reply": enriched["response"],
+            "quick_actions": enriched["quick_actions"],
+            "conversation_id": conversation_id,
             "raw_output": {
                 "route": "full",
                 "intent": state.get("intent"),

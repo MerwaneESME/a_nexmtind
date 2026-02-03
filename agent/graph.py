@@ -69,6 +69,85 @@ _VALIDATE_HINT_RE = re.compile(r"\b(valid|corrig|conform)\b", re.IGNORECASE)
 _ANALYZE_HINT_RE = re.compile(r"\b(analy|analyse|pdf|docx|document|fichier|pi[eè]ce jointe)\b", re.IGNORECASE)
 
 
+def generate_response_with_actions(
+    *,
+    query: str,
+    response_text: str,
+    metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Enrichit une réponse texte avec des actions rapides contextuelles."""
+    query_lower = (query or "").lower()
+
+    quick_actions: list[dict[str, str]] = []
+
+    # Action 1 : Checklist diagnostic (problèmes / diagnostics)
+    if any(
+        keyword in query_lower
+        for keyword in ("problème", "probleme", "panne", "fuite", "fissure", "défaut", "defaut", "casse", "diagnostic")
+    ):
+        quick_actions.append(
+            {
+                "id": "generate_checklist",
+                "label": "Générer checklist diagnostic",
+                "type": "diagnostic",
+                "icon": "📋",
+            }
+        )
+
+    # Action 2 : Mini-devis (estimation / prix)
+    if any(keyword in query_lower for keyword in ("prix", "coût", "cout", "budget", "devis", "combien", "estim")):
+        quick_actions.append(
+            {
+                "id": "create_estimate",
+                "label": "Créer un mini-devis",
+                "type": "pricing",
+                "icon": "💰",
+            }
+        )
+
+    # Action 3 : Liste matériaux (travaux / installation)
+    if any(
+        keyword in query_lower
+        for keyword in ("matériau", "materiau", "matériaux", "materiaux", "refaire", "poser", "installer", "rénover", "renover")
+    ):
+        quick_actions.append(
+            {
+                "id": "materials_list",
+                "label": "Liste matériaux + quantités",
+                "type": "materials",
+                "icon": "📊",
+            }
+        )
+
+    # Action 4 : Guide photos (diagnostic)
+    if any(keyword in query_lower for keyword in ("problème", "probleme", "fuite", "fissure", "diagnostic", "vérifier", "verifier")):
+        quick_actions.append(
+            {
+                "id": "photo_guide",
+                "label": "Que photographier ?",
+                "type": "photos",
+                "icon": "📸",
+            }
+        )
+
+    # Fallback
+    if not quick_actions:
+        quick_actions.append(
+            {
+                "id": "generate_checklist",
+                "label": "Organiser ce projet",
+                "type": "general",
+                "icon": "📋",
+            }
+        )
+
+    return {
+        "response": response_text,
+        "quick_actions": quick_actions[:3],  # max 3 actions
+        "metadata": metadata or {},
+    }
+
+
 def _maybe_parse_json(text: str) -> dict[str, Any] | None:
     try:
         return json.loads(text)

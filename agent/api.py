@@ -9,7 +9,7 @@ from typing import Any, Dict, List, Literal, Optional
 
 from fastapi import FastAPI, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from langchain_core.messages import HumanMessage, SystemMessage
 from pydantic import BaseModel, Field, validator
@@ -21,6 +21,7 @@ from .config import get_fast_llm, get_llm
 from .supabase_client import get_client, upsert_document
 from .tools import calculate_totals_tool, clean_lines_tool, supabase_lookup_tool, validate_devis_tool
 from .logging_config import logger
+from .utils.pdf_generator import ChecklistPDFGenerator, extract_checklist_info_with_llm
 
 # Cache par thread_id pour garder le dernier formulaire
 SESSION_PAYLOADS: dict[str, dict] = {}
@@ -1189,6 +1190,47 @@ async def prepare_devis(payload: PrepareDevisPayload):
         "corrections": corrections,
         "supabase": supabase_result,
     })
+
+
+class GenerateChecklistPdfPayload(BaseModel):
+    project_name: str | None = None
+    conversation_context: str
+    query: str | None = None
+
+
+@app.post("/generate-checklist-pdf")
+async def generate_checklist_pdf(payload: GenerateChecklistPdfPayload):
+    """Génère un PDF de checklist à partir du contexte (extraction LLM + design pro)."""
+    response_text = (payload.conversation_context or "").strip()
+    if not response_text:
+        return JSONResponse({"error": "conversation_context manquant"}, status_code=400)
+
+    extracted = extract_checklist_info_with_llm(response_text)
+
+    project_name = (str(extracted.get("project_name") or "") or "").strip()
+    if not project_name:
+        project_name = (payload.project_name or "").strip() or "Diagnostic BTP"
+
+    checkpoints = extracted.get("checkpoints") or []
+    alerts = extracted.get("alerts") or []
+    photos = extracted.get("photos") or []
+    materials = extracted.get("materials") or []
+
+    generator = ChecklistPDFGenerator()
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    pdf_path = generator.generate_checklist_pdf(
+        project_name=project_name,
+        checkpoints=[str(x) for x in checkpoints],
+        alerts=[str(x) for x in alerts],
+        photos_needed=[str(x) for x in photos],
+        materials=[str(x) for x in materials] if materials else None,
+        output_path=OUTPUT_DIR / f"checklist_{timestamp}.pdf",
+    )
+
+    filename = f"NEXTMIND_Checklist_{project_name[:20]}.pdf"
+    filename = re.sub(r"[^\\w\\s-]", "", filename).replace(" ", "_")
+
+    return FileResponse(str(pdf_path), media_type="application/pdf", filename=filename)
 
 
 @app.get("/health")
