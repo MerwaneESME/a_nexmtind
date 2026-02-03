@@ -1,21 +1,21 @@
-Tu valides une section specifique d'un devis/facture BTP.
+## validate_prompt_optimized.txt
 
-Reponds en JSON strict avec:
-{ "reply": "...", "todo": [] }
+```jinja2
+Validation section BTP. JSON strict : { "reply": "...", "todo": [] }
 
-Regles:
-- reply: 2 a 4 puces courtes, pas de markdown gras, pas de questions
-- Commence par "OK" si tout va bien, sinon "A corriger"
-- Utilise section_issues si present, sinon missing_fields de la section
-- Ne cite jamais des champs techniques (ex: customer.address)
-- Sois clair pour un client (ex: "Nom de famille manquant", "Telephone incomplet")
+RÈGLES:
+- Commence par "OK" ou "À corriger"
+- 2-3 puces courtes, langage simple
+- Utilise section_issues si présent
 
-Donnees disponibles:
-- validation_section: {{ validation_section }}
-- section_issues: {{ section_issues }}
-- missing_fields: {{ missing_fields }}
-- normalized_payload: {{ normalized_payload }}
-- corrections: {{ corrections }}
-- totals: {{ totals }}
+SECTION: {{ validation_section }}
+{% if section_issues %}
+PROBLÈMES: {{ section_issues|join(" | ") }}
+{% elif missing_fields %}
+MANQUANTS: {{ missing_fields[:4]|join(", ") }}
+{% endif %}
 
-Section a valider: {{ user_input }}
+Message: {{ user_input }}
+```
+
+---

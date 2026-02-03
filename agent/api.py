@@ -14,6 +14,8 @@ from fastapi.staticfiles import StaticFiles
 from langchain_core.messages import HumanMessage, SystemMessage
 from pydantic import BaseModel, Field, validator
 
+from api.chat import ChatInput as OptimizedChatInput
+from api.chat import handle_chat_non_stream, router as optimized_chat_router
 from .runtime import invoke_agent
 from .config import get_fast_llm, get_llm
 from .supabase_client import get_client, upsert_document
@@ -42,6 +44,9 @@ if STATIC_DIR.exists():
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR), html=True), name="static")
 if OUTPUT_DIR.exists():
     app.mount("/output", StaticFiles(directory=str(OUTPUT_DIR)), name="output")
+
+# Optimized /chat endpoint (JSON + SSE streaming)
+app.include_router(optimized_chat_router)
 
 
 def save_upload(file: UploadFile) -> str:
@@ -179,6 +184,25 @@ def _client_fast_reply(message: str) -> str | None:
         return _format_ai_reply(getattr(result, "content", None) or str(result)).strip() or None
     except Exception as exc:
         logger.warning("Client fast reply failed: %s", exc)
+        return None
+
+
+def _pro_fast_reply(message: str) -> str | None:
+    """Réponse rapide pour un professionnel (sans workflow complet)."""
+    system_prompt = (
+        "Tu es un assistant BTP pour un professionnel. "
+        "Réponds directement à la question POSÉE, sans te présenter et sans lister toutes tes capacités. "
+        "Donne une réponse concrète en français, structurée en 3 à 5 puces maximum. "
+        "Si la question porte sur les matériaux, propose des familles de matériaux avec avantages/inconvénients simples. "
+        "Ne parle pas du formulaire, ne parle pas de champs manquants, ne renvoie pas de JSON."
+    )
+    try:
+        llm = get_fast_llm()
+        result = llm.invoke([SystemMessage(content=system_prompt), HumanMessage(content=message)])
+        content = getattr(result, "content", None) or str(result)
+        return str(content).strip() or None
+    except Exception as exc:
+        logger.warning("Pro fast reply failed: %s", exc)
         return None
 
 
@@ -601,9 +625,71 @@ def _session_thread_id(thread_id: str, mode: str) -> str:
 
 # ==================== Endpoints API ====================
 
-@app.post("/chat")
-async def chat(payload: ChatInput):
+@app.post("/chat-legacy")
+async def chat_legacy(payload: ChatInput):
     """Chat conversationnel avec donnÃ©es du formulaire."""
+    # ==================== Fast path: aide generique pour faire un devis ====================
+    text_lower = (payload.message or "").lower()
+    meta_dict = payload.metadata if isinstance(payload.metadata, dict) else {}
+
+    # Cas: pro qui demande simplement de l'aide pour faire un devis, sans formulaire structure
+    user_role = str(meta_dict.get("user_role") or "").lower()
+    is_pro = user_role in {"professionnel", "pro"}
+
+    if "devis" in text_lower and ("aide" in text_lower or "aider" in text_lower or "m'aider" in text_lower) and is_pro:
+        # Liste des champs minimums a remplir pour demarrer un devis
+        missing_fields = [
+            "customer.name",
+            "customer.address",
+            "customer.contact",
+            "supplier.name",
+            "supplier.address",
+            "supplier.contact",
+            "line_items",
+        ]
+
+        reply_lines = [
+            "Oui, je peux t'aider a preparer ton devis. Pour commencer, il faut remplir quelques informations :",
+            "- Les coordonnees du client (nom, adresse, telephone ou email)",
+            "- Les informations de ton entreprise (nom, adresse, contact)",
+            "- Au moins une ligne de prestation avec description, quantite et prix HT",
+            "",
+            "Commence par renseigner ces champs dans le formulaire a gauche, puis je pourrai t'aider a verifier le devis et calculer les totaux.",
+        ]
+
+        reply_text = "\n".join(reply_lines)
+
+        return JSONResponse(
+            {
+                "reply": reply_text,
+                "raw_output": {
+                    "mode": "fast_help_devis",
+                    "missing_fields": missing_fields,
+                },
+                "corrections": [],
+                "totals": {},
+                "missing_fields": missing_fields,
+            }
+        )
+
+    # Cas: question pro sans données structurées -> réponse rapide pro sans passer par LangGraph
+    if is_pro:
+        # On considère rapide si aucune metadata de formulaire n'est fournie
+        has_form_metadata = any(k in meta_dict for k in ["customer_name", "client_name", "line_items", "items"])
+        if not has_form_metadata:
+            fast = _pro_fast_reply(payload.message)
+            if fast:
+                return JSONResponse(
+                    {
+                        "reply": fast,
+                        "raw_output": {"mode": "fast_pro", "user_role": user_role},
+                        "corrections": [],
+                        "totals": {},
+                        "missing_fields": [],
+                    }
+                )
+
+    # ==================== Flux normal LangGraph ====================
     messages = []
     if payload.history:
         for item in payload.history:
@@ -960,7 +1046,10 @@ async def validate_section(payload: ChatInput):
     # Alias vers /chat avec mode validate
     payload.metadata = payload.metadata or {}
     payload.metadata["mode"] = "validate"
-    return await chat(payload)
+
+    optimized_payload = OptimizedChatInput(**payload.model_dump())
+    result = await handle_chat_non_stream(optimized_payload)
+    return JSONResponse(result)
 
 
 @app.post("/analyze")
@@ -1106,6 +1195,3 @@ async def prepare_devis(payload: PrepareDevisPayload):
 async def health():
     """Health check."""
     return {"status": "ok", "version": "2.0"}
-
-
-

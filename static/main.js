@@ -41,16 +41,74 @@ const escapeHtml = (str = "") =>
 
 const renderMarkdownLite = (text = "") => {
   const escaped = escapeHtml(text);
-  return escaped
-    .replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
-    .replace(/\n/g, "<br>");
+  const withBold = escaped.replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>");
+
+  const lines = withBold.split(/\r?\n/);
+  const out = [];
+  let listType = null; // "ul" | "ol" | null
+  let listItems = [];
+
+  const flushList = () => {
+    if (!listItems.length) return;
+    const itemsHtml = listItems.map((li) => `<li>${li}</li>`).join("");
+    out.push(
+      listType === "ol"
+        ? `<ol class="msg-list">${itemsHtml}</ol>`
+        : `<ul class="msg-list">${itemsHtml}</ul>`
+    );
+    listItems = [];
+    listType = null;
+  };
+
+  lines.forEach((raw) => {
+    const line = (raw ?? "").trimEnd();
+    const bullet = line.match(/^\s*[-\u2022]\s+(.+)$/);
+    const ordered = line.match(/^\s*(\d+)[.)]\s+(.+)$/);
+
+    if (bullet) {
+      if (listType !== "ul") flushList();
+      listType = "ul";
+      listItems.push(bullet[1]);
+      return;
+    }
+    if (ordered) {
+      if (listType !== "ol") flushList();
+      listType = "ol";
+      listItems.push(ordered[2]);
+      return;
+    }
+
+    flushList();
+    if (!line.trim()) {
+      out.push(`<div class="msg-spacer"></div>`);
+      return;
+    }
+
+    const label = line.trim().replace(/:$/, "");
+    if (/^(Matériaux|Outils|Étapes|Vérifications|Consommables|Sécurité)$/i.test(label)) {
+      out.push(`<div class="msg-line"><strong>${label}</strong></div>`);
+      return;
+    }
+    out.push(`<div class="msg-line">${line}</div>`);
+  });
+
+  flushList();
+  return out.join("");
 };
 
-const addMessage = (role, content, meta = "", cls = "") => {
+const toPlainText = (html = "") => {
+  const tmp = document.createElement("div");
+  tmp.innerHTML = html;
+  return (tmp.textContent || "").trim();
+};
+
+const addMessage = (role, html, meta = "", cls = "", rawText = null, recordHistory = true) => {
   const wrap = document.createElement("div");
   wrap.className = `bubble ${role} ${cls}`.trim();
-  wrap.innerHTML = content;
-  history.push({ role, content });
+  wrap.innerHTML = html;
+  if (recordHistory) {
+    history.push({ role, content: rawText != null ? String(rawText) : toPlainText(html) });
+  }
   if (meta) {
     const m = document.createElement("div");
     m.className = "meta";
@@ -120,7 +178,7 @@ const renderResult = (payload) => {
   removeLoading();
   clearQuickReplies();
   if (reply) {
-    const bubble = addMessage("assistant", renderMarkdownLite(reply));
+    const bubble = addMessage("assistant", renderMarkdownLite(reply), "", "", reply);
     const opts = parseOptions(reply);
     if (opts.length) {
       const inline = document.createElement("div");
@@ -179,8 +237,8 @@ const renderResult = (payload) => {
 const sendFile = async (file) => {
   const fd = new FormData();
   fd.append("file", file);
-  addMessage("user", renderMarkdownLite(`Fichier : ${file.name}`));
-  loadingBubble = addMessage("assistant", `<span class="spinner"></span> Analyse...`, "", "loading");
+  addMessage("user", renderMarkdownLite(`Fichier : ${file.name}`), "", "", `Fichier : ${file.name}`);
+  loadingBubble = addMessage("assistant", `<span class="spinner"></span> Analyse...`, "", "loading", null, false);
   try {
     const resp = await fetch(`/analyze`, { method: "POST", body: fd });
     const text = await resp.text();
@@ -194,8 +252,8 @@ const sendFile = async (file) => {
 };
 
 const sendChat = async (text) => {
-  addMessage("user", renderMarkdownLite(text));
-  loadingBubble = addMessage("assistant", `<span class="spinner"></span>`, "", "loading");
+  addMessage("user", renderMarkdownLite(text), "", "", text);
+  loadingBubble = addMessage("assistant", `<span class="spinner"></span>`, "", "loading", null, false);
   try {
     const threadId = ensureThreadId();
     const metadata = loadFormMeta();
@@ -241,7 +299,13 @@ fileInput.addEventListener("change", (e) => {
   const f = e.target.files?.[0];
   if (f) {
     pendingFile = f;
-    addMessage("assistant", renderMarkdownLite(`Fichier prêt : ${f.name}. Clique sur Envoyer pour lancer l'analyse.`));
+    addMessage(
+      "assistant",
+      renderMarkdownLite(`Fichier prêt : ${f.name}. Clique sur Envoyer pour lancer l'analyse.`),
+      "",
+      "",
+      `Fichier prêt : ${f.name}. Clique sur Envoyer pour lancer l'analyse.`
+    );
   }
 });
 sendBtn.addEventListener("click", onSend);

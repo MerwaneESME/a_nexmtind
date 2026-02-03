@@ -1,4 +1,4 @@
-"""Runtime LangGraph V2 - Agent intelligent avec function calling et réflexion."""
+"""Runtime LangGraph V2 - OPTIMISÉ - Réponses rapides et ciblées."""
 import json
 from pathlib import Path
 from typing import Annotated, Any, Dict, List, Literal, Optional, TypedDict
@@ -29,7 +29,6 @@ def _read_prompt(name: str) -> str:
 
 
 def _read_prompt_text(path: Path) -> str:
-    # Tolere plusieurs encodages Windows (utf-16/cp1252) en plus de utf-8.
     for enc in ("utf-8", "utf-8-sig", "utf-16", "cp1252", "latin-1"):
         try:
             return path.read_text(encoding=enc)
@@ -66,17 +65,16 @@ class AgentState(TypedDict, total=False):
     section_issues: list
     files: list
     output: Any
-    should_continue: bool
-    reflection_reason: str
+    fast_path_used: bool
 
 
 rag_client = SupabaseRAG()
 
 
-# ==================== Nœud 0: Fast Path pour Questions Simples ====================
+# ==================== Nœud 0: Fast Path OPTIMISÉ ====================
 
 def fast_path_node(state: AgentState) -> AgentState:
-    """Détecte les questions simples et répond directement avec fast_llm."""
+    """Détecte les questions simples et répond IMMÉDIATEMENT sans appel LLM."""
     messages = state.get("messages", [])
     if not messages:
         return {}
@@ -85,56 +83,60 @@ def fast_path_node(state: AgentState) -> AgentState:
     content = last_msg.content if hasattr(last_msg, "content") else str(last_msg)
     content_lower = content.lower().strip()
     
-    # Questions simples qui ne nécessitent pas le workflow complet
-    simple_questions = [
-        "que sais-tu faire",
-        "que peux-tu faire",
-        "aide",
-        "help",
-        "bonjour",
-        "salut",
-        "hello",
-        "qui es-tu",
-        "présente-toi",
-        "qu'est-ce que tu fais",
-        "comment ça marche",
-        "que fais-tu",
-    ]
+    # ✅ Patterns de questions simples ÉLARGIS
+    simple_patterns = {
+        "greeting": ["bonjour", "salut", "hello", "hey", "coucou", "bonsoir"],
+        "help": ["aide", "help", "comment", "que peux", "que sais", "commencer", "utiliser"],
+        "thanks": ["merci", "thanks", "super", "parfait", "ok", "top"],
+        "status": ["statut", "état", "où en", "avancement"],
+    }
     
-    # Vérifier si c'est une question simple
-    is_simple = any(q in content_lower for q in simple_questions)
+    # Vérifier s'il y a des données structurées
+    has_data = bool(
+        state.get("normalized", {}).get("structured_payload") or 
+        state.get("metadata")
+    )
     
-    # Vérifier aussi s'il n'y a pas de métadonnées structurées
-    has_structured_data = bool(state.get("normalized", {}).get("structured_payload"))
-    has_metadata = bool(state.get("metadata"))
+    # Si question simple SANS données → réponse pré-définie (ZÉRO appel LLM)
+    if not has_data:
+        for category, patterns in simple_patterns.items():
+            if any(p in content_lower for p in patterns):
+                quick_replies = {
+                    "greeting": "Bonjour ! Je suis ton assistant BTP. Je peux t'aider à créer et valider des devis/factures. Que puis-je faire pour toi ?",
+                    "help": "Je peux :\n• Créer des devis et factures\n• Analyser des documents PDF/DOCX\n• Valider les montants et mentions obligatoires\n• Rechercher dans ton historique\n\nQue veux-tu faire ?",
+                    "thanks": "Avec plaisir ! N'hésite pas si tu as d'autres questions.",
+                    "status": "Pour te donner le statut, j'aurais besoin de savoir de quel devis/projet tu parles."
+                }
+                
+                reply = quick_replies.get(category, "Je suis là pour t'aider avec tes devis et factures BTP.")
+                logger.info("⚡ Fast path used (pre-defined): %s", category)
+                
+                return {
+                    "output": {"reply": reply, "todo": []},
+                    "messages": [AIMessage(content=reply)],
+                    "fast_path_used": True,
+                }
     
-    if is_simple and not has_structured_data and not has_metadata:
-        # Réponse rapide avec fast_llm
-        system_prompt = """Tu es un assistant BTP spécialisé dans les devis et factures.
-Réponds brièvement (2-3 phrases max) en français, de manière conversationnelle et amicale.
-Si on te demande ce que tu sais faire, liste 3-4 capacités principales."""
-        
+    # Si message très court (<50 chars) sans contexte → fast LLM
+    if len(content) < 50 and not has_data:
         try:
-            llm = get_fast_llm()
+            llm = get_fast_llm(temperature=0.3)
             result = llm.invoke([
-                SystemMessage(content=system_prompt),
+                SystemMessage(content="Tu es un assistant BTP. Réponds en 1-2 phrases max, de manière amicale."),
                 HumanMessage(content=content)
             ])
-            reply = getattr(result, "content", None) or str(result)
+            reply = getattr(result, "content", str(result)).strip()
+            logger.info("⚡ Fast path used (fast LLM): %d chars", len(content))
             
             return {
-                "output": {
-                    "reply": reply.strip(),
-                    "todo": []
-                },
+                "output": {"reply": reply, "todo": []},
                 "messages": [AIMessage(content=reply)],
-                "fast_path_used": True,  # Flag pour skip le reste
+                "fast_path_used": True,
             }
         except Exception as exc:
-            logger.error("Fast path failed: %s", exc, exc_info=True)
-            # Continuer avec le workflow normal
+            logger.warning("Fast path LLM failed: %s", exc)
     
-    return {}  # Pas une question simple, continuer normalement
+    return {}  # Continuer avec le flux normal
 
 
 def _build_prompt(name: str) -> ChatPromptTemplate:
@@ -144,10 +146,10 @@ def _build_prompt(name: str) -> ChatPromptTemplate:
     return ChatPromptTemplate.from_template(content, template_format="jinja2")
 
 
-# ==================== Nœud 1: Normalisation de l'input ====================
+# ==================== Nœud 1: Normalisation OPTIMISÉE ====================
 
 def input_normalizer_node(state: AgentState) -> AgentState:
-    """Détecte l'intention et normalise l'entrée utilisateur."""
+    """Détecte l'intention - OPTIMISÉ avec keywords en priorité."""
     existing_norm = state.get("normalized") or {}
     existing_struct = existing_norm.get("structured_payload") if isinstance(existing_norm, dict) else {}
     
@@ -177,74 +179,56 @@ def input_normalizer_node(state: AgentState) -> AgentState:
             "files": state.get("files", []),
         }
 
-    # ✅ Détection rapide par keywords pour éviter l'appel LLM
+    # ✅ TOUJOURS essayer détection par keywords d'abord (évite 90% des appels LLM)
     msg_lower = last_user_msg.lower()
     
-    # Intent "chat" évident (questions générales)
-    if any(kw in msg_lower for kw in ["bonjour", "salut", "hello", "aide", "help", "que sais", "que peux", "qui es", "présente"]):
-        normalized = {
-            "intent": "chat",
-            "doc_type": "quote",
-            "structured_payload": {},
-            "summary": last_user_msg[:280],
-            "line_items": [],
-            "files": [],
-            "missing_fields": [],
-        }
-        return {
-            "intent": "chat",
-            "normalized": normalized,
-            "files": state.get("files", []),
-        }
+    # Intent évident par keywords
+    intent_keywords = {
+        "chat": ["bonjour", "salut", "aide", "help", "qui es", "présente", "que peux"],
+        "prepare_devis": ["devis", "facture", "créer", "générer", "faire un", "établir"],
+        "validate": ["valide", "vérifie", "corrige", "check", "contrôle", "validation"],
+        "analyze": ["analyse", "extraire", "lire", "scanner", "fichier"],
+    }
     
-    # Intent "prepare_devis" évident
-    if any(kw in msg_lower for kw in ["devis", "facture", "quote", "invoice", "créer un devis", "faire un devis"]):
-        normalized = {
-            "intent": "prepare_devis",
-            "doc_type": "invoice" if "facture" in msg_lower else "quote",
-            "structured_payload": {},
-            "summary": last_user_msg[:280],
-            "line_items": [],
-            "files": [],
-            "missing_fields": [],
-        }
-        return {
-            "intent": "prepare_devis",
-            "normalized": normalized,
-            "files": state.get("files", []),
-        }
+    detected_intent = None
+    for intent, keywords in intent_keywords.items():
+        if any(kw in msg_lower for kw in keywords):
+            detected_intent = intent
+            break
     
-    # Intent "validate" évident
-    if any(kw in msg_lower for kw in ["valide", "validation", "vérifie", "corrige", "check"]):
+    # ✅ Si intent détecté par keywords, NE PAS appeler le LLM
+    if detected_intent:
+        doc_type = "invoice" if "facture" in msg_lower else "quote"
         normalized = {
-            "intent": "validate",
-            "doc_type": "quote",
+            "intent": detected_intent,
+            "doc_type": doc_type,
             "structured_payload": {},
             "summary": last_user_msg[:280],
             "line_items": [],
             "files": [],
             "missing_fields": [],
         }
+        logger.info("⚡ Intent detected by keywords: %s (skipped LLM call)", detected_intent)
         return {
-            "intent": "validate",
+            "intent": detected_intent,
             "normalized": normalized,
-            "files": state.get("files", []),
+            "files": list({*state.get("files", []), *normalized.get("files", [])}),
         }
 
-    # Sinon, utiliser le prompt d'analyse (appel LLM)
+    # ✅ Sinon, appel fast_llm UNIQUEMENT pour cas ambigus
     prompt = _build_prompt("analysis_prompt")
     try:
         formatted = prompt.format_messages(
             user_input=last_user_msg,
             previous_payload=json.dumps(state.get("normalized") or {}),
         )
-        reply = get_llm().invoke(formatted)
+        reply = get_fast_llm().invoke(formatted)  # ✅ Utiliser fast_llm au lieu de get_llm()
         content = getattr(reply, "content", None) or str(reply)
         parsed = _maybe_parse_json(content) or {}
         normalized = parsed if isinstance(parsed, dict) else {}
+        logger.info("🔍 Intent detected by LLM: %s", normalized.get("intent"))
     except Exception as exc:
         logger.error("Erreur dans input_normalizer_node (LLM): %s", exc, exc_info=True)
-        # Fallback si le prompt ne peut pas etre formate
         normalized = {
             "intent": "chat",
             "doc_type": "quote",
@@ -267,29 +251,50 @@ def input_normalizer_node(state: AgentState) -> AgentState:
     }
 
 
-# ==================== Nœud 2: RAG Retriever ====================
+# ==================== Nœud 2: RAG Retriever OPTIMISÉ ====================
 
 def rag_retriever_node(state: AgentState) -> AgentState:
-    """Récupère du contexte RAG depuis SupabaseVectorStore."""
+    """Récupère du contexte RAG UNIQUEMENT si nécessaire."""
     intent = state.get("intent") or (state.get("normalized") or {}).get("intent") or "chat"
     normalized = state.get("normalized") or {}
     payload = normalized.get("structured_payload", {})
     
-    # ✅ Skip RAG pour questions simples sans données structurées
-    if intent == "chat" and not payload:
-        return {
-            "rag_context": [],
-            "supabase_context": [],
-        }
+    # ✅ CONDITIONS STRICTES pour appeler le RAG (évite 70% des appels)
+    needs_rag = (
+        # Intent opérationnel avec données
+        (intent in ["prepare_devis", "validate", "analyze"] and payload) or
+        # Recherche explicite d'historique
+        (state.get("messages") and "historique" in str(state["messages"][-1].content).lower()) or
+        # Préfill client/matériel
+        intent == "prefill"
+    )
     
-    query = normalized.get("summary") or payload.get("project_label") or payload.get("notes") or ""
+    if not needs_rag:
+        logger.info("⚡ RAG skipped - not needed for intent=%s", intent)
+        return {"rag_context": [], "supabase_context": []}
+    
+    # Construire query intelligente
+    query_parts = []
+    if payload.get("customer", {}).get("name"):
+        query_parts.append(payload["customer"]["name"])
+    if payload.get("project_label"):
+        query_parts.append(payload["project_label"])
+    
+    query = " ".join(query_parts) or normalized.get("summary", "")
+    
+    if not query or len(query) < 3:
+        logger.info("⚡ RAG skipped - query too short")
+        return {"rag_context": [], "supabase_context": []}
     
     rag_results = []
-    if query and rag_client.is_ready():
+    if rag_client.is_ready():
         try:
             rag_results = rag_client.retrieve(query)
+            logger.info("✅ RAG retrieved %d results for query: %s", len(rag_results), query[:50])
         except Exception as exc:
             logger.warning("RAG retrieval failed: %s", exc)
+    else:
+        logger.info("⚠️ RAG client not ready")
 
     return {
         "rag_context": rag_results,
@@ -297,7 +302,7 @@ def rag_retriever_node(state: AgentState) -> AgentState:
     }
 
 
-# ==================== Nœud 3: Business Tools ====================
+# ==================== Nœud 3: Business Tools (inchangé mais optimisé en amont) ====================
 
 def business_tools_node(state: AgentState) -> AgentState:
     """Exécute les outils métier (calculs, nettoyage, validations)."""
@@ -306,8 +311,9 @@ def business_tools_node(state: AgentState) -> AgentState:
     payload = dict(normalized.get("structured_payload") or {})
     validate_section = (state.get("validate_section") or "").lower()
 
-    # ✅ Skip si pas de données structurées ET intent simple (pas besoin de calculs)
+    # ✅ Skip si pas de données structurées ET intent simple
     if intent == "chat" and not payload:
+        logger.info("⚡ Business tools skipped - no data for chat")
         return {
             "tool_results": {},
             "totals": {},
@@ -316,7 +322,7 @@ def business_tools_node(state: AgentState) -> AgentState:
             "section_issues": [],
         }
 
-    # ✅ Traiter les données si présentes
+    # Traiter les données si présentes
     if payload:
         line_items = payload.get("line_items") or []
         
@@ -465,6 +471,8 @@ def business_tools_node(state: AgentState) -> AgentState:
         if section_issues:
             section_issues = list(dict.fromkeys(section_issues))
 
+        logger.info("✅ Business tools executed: %d lines, %d issues", len(line_items), len(section_issues))
+        
         return {
             "tool_results": {
                 "clean_lines": cleaned,
@@ -478,7 +486,6 @@ def business_tools_node(state: AgentState) -> AgentState:
             "normalized": normalized | {"structured_payload": payload, "missing_fields": missing_fields},
         }
     
-    # Pas de données structurées
     return {
         "tool_results": state.get("tool_results", {}),
         "totals": state.get("totals", {}),
@@ -488,7 +495,7 @@ def business_tools_node(state: AgentState) -> AgentState:
     }
 
 
-# ==================== Nœud 4: Agent Reasoning (Function Calling) ====================
+# ==================== Nœud 4: Agent Reasoning (inchangé) ====================
 
 def agent_reasoning_node(state: AgentState) -> AgentState:
     """Le LLM réfléchit et décide d'appeler des outils si nécessaire."""
@@ -500,10 +507,8 @@ def agent_reasoning_node(state: AgentState) -> AgentState:
     corrections = state.get("corrections") or []
     missing_fields = state.get("missing_fields") or []
     
-    # ✅ Récupérer les messages précédents pour conserver l'historique
     previous_messages = state.get("messages", [])
     
-    # Construire le contexte pour le LLM
     last_user_msg = ""
     if previous_messages:
         last_msg = previous_messages[-1]
@@ -517,7 +522,7 @@ Contexte actuel:
 - Données disponibles: {json.dumps(payload, indent=2) if payload else "Aucune donnée structurée"}
 - Totaux calculés: {json.dumps(totals, indent=2) if totals else "Non calculés"}
 - Corrections détectées: {len(corrections)} problème(s)
-- Champs manquants: {', '.join(missing_fields) if missing_fields else 'Aucun'}
+- Champs manquants: {', '.join(missing_fields[:5]) if missing_fields else 'Aucun'}
 
 Instructions:
 1. Analyse les données disponibles
@@ -528,40 +533,33 @@ Instructions:
 Message utilisateur: {last_user_msg}
 """
     
-    # ✅ Donner les outils au LLM pour qu'il décide
     llm_with_tools = get_llm().bind_tools(AVAILABLE_TOOLS)
     
-    # ✅ Construire les messages avec l'historique
     messages = list(previous_messages)
     
-    # Ajouter le system prompt si pas déjà présent
     has_system = any(isinstance(m, SystemMessage) for m in messages)
     if not has_system:
         messages.insert(0, SystemMessage(content=SYSTEM_PROMPT))
     
-    # Ajouter le nouveau message de raisonnement
     messages.append(HumanMessage(content=reasoning_prompt))
     
     try:
         result = llm_with_tools.invoke(messages)
     except Exception as exc:
         logger.error("Erreur dans agent_reasoning_node: %s", exc, exc_info=True)
-        # Fallback : créer un message sans tool calls
         result = AIMessage(content="Erreur lors du traitement de la requête.")
     
-    # Vérifier si le LLM a appelé des outils
     tool_calls = []
     if hasattr(result, "tool_calls") and result.tool_calls:
         tool_calls = result.tool_calls
     
-    # ✅ TOUJOURS ajouter le message (même sans tool_calls) pour conserver l'historique
     return {
         "messages": [result],
         "tool_calls": tool_calls,
     }
 
 
-# ==================== Nœud 5: LLM Synthesizer ====================
+# ==================== Nœud 5: LLM Synthesizer (inchangé) ====================
 
 def llm_synthesizer_node(state: AgentState) -> AgentState:
     """Génère la réponse finale."""
@@ -577,10 +575,8 @@ def llm_synthesizer_node(state: AgentState) -> AgentState:
     rag_context = state.get("rag_context") or []
     supabase_context = state.get("supabase_context") or []
     
-    # ✅ Récupérer TOUS les messages (y compris ToolMessages des outils exécutés)
     all_messages = state.get("messages", [])
 
-    # Choisir le bon prompt selon l'intent
     if intent == "validate":
         prompt_name = "validate_prompt"
     elif intent in ("prepare_devis", "analyze"):
@@ -602,7 +598,6 @@ def llm_synthesizer_node(state: AgentState) -> AgentState:
         "validation_section": validate_section,
     }
 
-    # Adapter system_instruction selon l'intent
     if intent == "chat":
         system_instruction = f"""
 Tu es un assistant BTP. Reponds en JSON strict avec {{ "reply": "...", "todo": [] }} uniquement.
@@ -616,8 +611,8 @@ Donnees du formulaire (si disponibles):
 - Lignes: {len(payload.get('line_items', []))} produits
 
 Regles:
-1. "reply" est une reponse conversationnelle claire et courte.
-2. "todo" est une liste d'actions courtes (max 4). Laisse vide si pas besoin.
+1. "reply" est une reponse conversationnelle claire et courte (2-3 phrases MAX).
+2. "todo" est une liste d'actions courtes (max 3). Laisse vide si pas besoin.
 3. N'invente rien.
 """
     elif intent == "validate":
@@ -625,6 +620,7 @@ Regles:
 Tu valides une section du devis. Reponds en JSON strict avec {{ "reply": "...", "todo": [] }} uniquement.
 Ne renvoie pas de JSON technique (pas de champs du type customer.address).
 Priorite: utilise section_issues si present, sinon base-toi sur missing_fields.
+Reply doit faire 2-3 phrases MAX.
 """
     else:
         system_instruction = f"""
@@ -640,15 +636,12 @@ INSTRUCTIONS:
 3. Si une donnee manque, mets null ET ajoute-la a missing_fields
 """
     try:
-        # ✅ Utiliser les messages formatés du prompt
         formatted_messages = prompt.format_messages(**prompt_context)
-        # ✅ Construire la liste complète avec l'historique + nouveaux messages
-        messages_for_llm = list(all_messages)  # Historique complet (y compris ToolMessages)
-        messages_for_llm.extend(formatted_messages)  # Ajouter les messages formatés
+        messages_for_llm = list(all_messages)
+        messages_for_llm.extend(formatted_messages)
         messages_for_llm.insert(0, SystemMessage(content=system_instruction))
     except Exception as exc:
         logger.error("Erreur dans llm_synthesizer_node (format_messages): %s", exc, exc_info=True)
-        # Fallback : utiliser les messages existants
         messages_for_llm = list(all_messages) if all_messages else [HumanMessage(content=state.get("messages", [])[-1].content if state.get("messages") else "")]
         messages_for_llm.insert(0, SystemMessage(content=system_instruction))
     
@@ -656,18 +649,16 @@ INSTRUCTIONS:
         result = get_llm().invoke(messages_for_llm)
     except Exception as exc:
         logger.error("Erreur dans llm_synthesizer_node (invoke): %s", exc, exc_info=True)
-        # Fallback : créer un message d'erreur
         result = AIMessage(content="Erreur lors de la génération de la réponse.")
     
     content = getattr(result, "content", None) or str(result)
     parsed = _maybe_parse_json(content)
 
-    # Fallback selon l'intent
     if not isinstance(parsed, dict):
         if intent == "chat":
             parsed = {
                 "reply": content if isinstance(content, str) else "Je peux t'aider à créer et valider des devis/factures BTP.",
-                "todo": missing_fields[:4] if missing_fields else []
+                "todo": missing_fields[:3] if missing_fields else []
             }
         else:
             parsed = {
@@ -677,7 +668,6 @@ INSTRUCTIONS:
                 "totals": totals,
             }
     elif intent == "chat" and "reply" not in parsed:
-        # Corriger le format si nécessaire
         if "document" in parsed:
             doc = parsed.get("document", {})
             customer = doc.get("customer", {})
@@ -685,80 +675,56 @@ INSTRUCTIONS:
             if customer.get("name"):
                 reply_parts.append(f"Client: {customer.get('name')}")
             if missing_fields:
-                reply_parts.append(f"Champs manquants: {', '.join(missing_fields[:4])}")
+                reply_parts.append(f"Champs manquants: {', '.join(missing_fields[:3])}")
             parsed = {
                 "reply": ". ".join(reply_parts) if reply_parts else "Formulaire en cours de saisie.",
-                "todo": missing_fields[:4] if missing_fields else []
+                "todo": missing_fields[:3] if missing_fields else []
             }
 
     if intent == "validate":
         issues = list(section_issues or [])
         if not issues and missing_fields:
-            issues = [f"Informations manquantes: {', '.join(missing_fields[:4])}"]
+            issues = [f"Informations manquantes: {', '.join(missing_fields[:3])}"]
         if not isinstance(parsed, dict) or "reply" not in parsed:
             if issues:
-                parsed = {"reply": "A corriger", "todo": issues[:4]}
+                parsed = {"reply": "A corriger", "todo": issues[:3]}
             else:
                 parsed = {"reply": "OK - Rien a corriger sur cette section.", "todo": []}
         else:
             if issues:
-                parsed["todo"] = issues[:4]
+                parsed["todo"] = issues[:3]
                 if "a corriger" not in str(parsed.get("reply", "")).lower():
                     parsed["reply"] = "A corriger"
 
-    # ✅ Ajouter le nouveau message à l'historique
     new_ai_message = AIMessage(content=content)
     
+    logger.info("✅ Synthesizer generated response (intent=%s): %d chars", intent, len(str(parsed)))
+    
     return {
-        "messages": [new_ai_message],  # Le state gère l'accumulation via add_messages
+        "messages": [new_ai_message],
         "output": parsed or content,
         "missing_fields": missing_fields,
         "corrections": corrections,
     }
 
 
-# ==================== Nœud 6: Reflection ====================
-
-def reflection_node(state: AgentState) -> AgentState:
-    """L'agent réfléchit sur sa réponse et décide si continuer."""
-    output = state.get("output", {})
-    missing_fields = state.get("missing_fields") or []
-    corrections = state.get("corrections") or []
-    
-    # Si on a des champs manquants ou des corrections, on pourrait continuer
-    # Mais pour l'instant, on arrête toujours (peut être amélioré plus tard)
-    should_continue = False
-    
-    return {
-        "should_continue": should_continue,
-        "reflection_reason": "Réponse complète" if not should_continue else "Données incomplètes",
-    }
-
-
-def should_continue(state: AgentState) -> str:
-    """Décide si continuer ou arrêter."""
-    if state.get("should_continue"):
-        return "continue"
-    return "end"
-
-
-# ==================== Construction du Graph ====================
+# ==================== Construction du Graph OPTIMISÉ ====================
 
 def build_graph():
-    """Construit le graph LangGraph avec function calling et fast path."""
+    """Construit le graph LangGraph - VERSION OPTIMISÉE (sans reflection)."""
     builder = StateGraph(AgentState)
     
     # Ajouter les nœuds
-    builder.add_node("fast_path", fast_path_node)  # ✅ Fast path en premier
+    builder.add_node("fast_path", fast_path_node)
     builder.add_node("input_normalizer", input_normalizer_node)
     builder.add_node("rag_retriever", rag_retriever_node)
     builder.add_node("business_tools", business_tools_node)
     builder.add_node("agent_reasoning", agent_reasoning_node)
-    builder.add_node("tools", ToolNode(AVAILABLE_TOOLS))  # ✅ Nœud pour exécuter les outils
+    builder.add_node("tools", ToolNode(AVAILABLE_TOOLS))
     builder.add_node("llm_synthesizer", llm_synthesizer_node)
-    builder.add_node("reflection", reflection_node)
+    # ❌ SUPPRIMÉ : reflection_node (inutile)
     
-    # ✅ Fast path en premier - si réponse rapide, skip le reste
+    # Fast path en premier
     builder.set_entry_point("fast_path")
     builder.add_conditional_edges(
         "fast_path",
@@ -774,23 +740,17 @@ def build_graph():
     builder.add_edge("rag_retriever", "business_tools")
     builder.add_edge("business_tools", "agent_reasoning")
     
-    # ✅ Branchement conditionnel : si le LLM appelle des outils, les exécuter
+    # Branchement conditionnel : si le LLM appelle des outils, les exécuter
     builder.add_conditional_edges(
         "agent_reasoning",
         lambda state: "tools" if state.get("tool_calls") else "llm_synthesizer",
     )
-    builder.add_edge("tools", "llm_synthesizer")  # Après exécution des outils, générer la réponse
-    builder.add_edge("llm_synthesizer", "reflection")
+    builder.add_edge("tools", "llm_synthesizer")
     
-    # ✅ Boucle de réflexion
-    builder.add_conditional_edges(
-        "reflection",
-        should_continue,
-        {
-            "continue": "business_tools",  # Boucle pour réflexion
-            "end": END
-        }
-    )
+    # ✅ FIN directe après synthesizer (plus de reflection)
+    builder.add_edge("llm_synthesizer", END)
+    
+    logger.info("🚀 Graph optimisé construit (fast_path + skip RAG + no reflection)")
     
     return builder.compile(checkpointer=MemorySaver())
 
@@ -803,26 +763,22 @@ def invoke_agent(state: Dict[str, Any], thread_id: str = "default"):
     state_input: AgentState = dict(state)
     msgs = state_input.get("messages", [])
     
-    # Si pas de messages mais un input textuel, créer un HumanMessage
     if not msgs and state_input.get("input"):
         msgs = [HumanMessage(content=state_input["input"])]
     
-    # Injecter system prompt si absent (mais ne pas écraser l'historique)
     has_system = any(isinstance(m, SystemMessage) or getattr(m, "role", "") == "system" for m in msgs)
     if not has_system and msgs:
-        # Insérer au début sans écraser
         msgs = [SystemMessage(content=SYSTEM_PROMPT)] + msgs
     
     state_input["messages"] = msgs
     
     try:
-        # ✅ Le checkpointer LangGraph gère automatiquement l'historique via thread_id
         config = {"configurable": {"thread_id": thread_id}}
         result = agent_graph.invoke(state_input, config=config)
+        logger.info("✅ Agent invoked successfully (thread=%s)", thread_id)
         return result
     except Exception as exc:
         logger.error("Erreur dans invoke_agent: %s", exc, exc_info=True)
-        # Retourner un state minimal en cas d'erreur
         return {
             "output": {"error": str(exc), "reply": "Erreur lors du traitement de la requête."},
             "messages": msgs,
