@@ -68,6 +68,58 @@ _CLEAN_HINT_RE = re.compile(r"\b(nettoi|d[eé]doubl|uniformi)\b", re.IGNORECASE)
 _VALIDATE_HINT_RE = re.compile(r"\b(valid|corrig|conform)\b", re.IGNORECASE)
 _ANALYZE_HINT_RE = re.compile(r"\b(analy|analyse|pdf|docx|document|fichier|pi[eè]ce jointe)\b", re.IGNORECASE)
 
+_DEVIS_TERMS_HINT_RE = re.compile(
+    r"\b(termes?|mots?|jargon|lexique|glossaire|clarif|expliq|d[eé]fin|d[eé]cortiq|comprendr)\b",
+    re.IGNORECASE,
+)
+_DEVIS_CONTEXT_RE = re.compile(r"\b(devis|facture)\b", re.IGNORECASE)
+_TERM_DEFINITION_RE = re.compile(
+    r"\b(c['’]est quoi|ça veut dire|ca veut dire|qu['’]est-ce que|definition|définition)\b",
+    re.IGNORECASE,
+)
+_BTP_TERMS_LIKELY_RE = re.compile(
+    r"\b(acompte|tva|d[eé]cennale|rc\s*pro|dommages?-ouvrage|ipn|poutre|ragr[eé]age|chape|[eé]tanch[eé]it[eé]|consuel|plomberie|gros\s*œuvre|gros\s*oeuvre|d[eé]molition)\b",
+    re.IGNORECASE,
+)
+
+
+def _should_show_devis_terms_ui(query: str) -> bool:
+    q = (query or "").strip()
+    if not q:
+        return False
+
+    q_lower = q.lower()
+
+    if _DEVIS_CONTEXT_RE.search(q) and _DEVIS_TERMS_HINT_RE.search(q):
+        return True
+
+    if _TERM_DEFINITION_RE.search(q) and _BTP_TERMS_LIKELY_RE.search(q):
+        return True
+
+    if "devis" in q_lower and ("explique" in q_lower or "clarifie" in q_lower):
+        return True
+
+    return False
+
+
+def _build_devis_terms_ui_reply(query: str) -> str:
+    payload_query = (query or "").strip()
+    q_lower = payload_query.lower()
+    if any(k in q_lower for k in ("termes", "mots", "jargon", "lexique", "glossaire")):
+        payload_query = ""
+
+    payload = {"query": payload_query}
+    payload_json = json.dumps(payload, ensure_ascii=False)
+
+    return (
+        "Je vous aide à comprendre les termes techniques qu’on voit souvent sur un devis BTP.\n\n"
+        "```devis-terms\n"
+        f"{payload_json}\n"
+        "```\n\n"
+        "Si vous le souhaitez, vous pouvez aussi me copier/coller une ligne du devis (ou envoyer le PDF) "
+        "et je vous l’explique poste par poste."
+    )
+
 
 def generate_response_with_actions(
     *,
@@ -79,6 +131,17 @@ def generate_response_with_actions(
     query_lower = (query or "").lower()
 
     quick_actions: list[dict[str, str]] = []
+
+    if _should_show_devis_terms_ui(query):
+        response_text = _build_devis_terms_ui_reply(query)
+        quick_actions.append(
+            {
+                "id": "devis_terms",
+                "label": "Lexique du devis",
+                "type": "devis",
+                "icon": "📚",
+            }
+        )
 
     # Action 1 : Checklist diagnostic (problèmes / diagnostics)
     if any(

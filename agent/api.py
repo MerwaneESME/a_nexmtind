@@ -1,4 +1,5 @@
 ﻿"""API FastAPI V2 - Gestion correcte des donnÃ©es structurÃ©es."""
+import json
 import os
 import re
 import tempfile
@@ -205,6 +206,61 @@ def _pro_fast_reply(message: str) -> str | None:
     except Exception as exc:
         logger.warning("Pro fast reply failed: %s", exc)
         return None
+
+
+# ==================== Devis terms UI (front-end cards) ====================
+
+_DEVIS_TERMS_HINT_RE = re.compile(
+    r"\b(termes?|mots?|jargon|lexique|glossaire|clarif|expliq|défin|defin|décortiq|decortiq|comprendr)\b",
+    re.IGNORECASE,
+)
+_DEVIS_CONTEXT_RE = re.compile(r"\b(devis|facture)\b", re.IGNORECASE)
+_TERM_DEFINITION_RE = re.compile(
+    r"\b(c['’]est quoi|ça veut dire|ca veut dire|qu['’]est-ce que|definition|définition)\b",
+    re.IGNORECASE,
+)
+_BTP_TERMS_LIKELY_RE = re.compile(
+    r"\b(acompte|tva|décennale|decennale|rc\s*pro|dommages?-ouvrage|ipn|poutre|ragréage|ragreage|chape|étanchéité|etancheite|consuel|plomberie|gros\s*œuvre|gros\s*oeuvre|démolition|demolition)\b",
+    re.IGNORECASE,
+)
+
+
+def _should_show_devis_terms_ui(message: str) -> bool:
+    msg = (message or "").strip()
+    if not msg:
+        return False
+
+    msg_lower = msg.lower()
+
+    if _DEVIS_CONTEXT_RE.search(msg) and _DEVIS_TERMS_HINT_RE.search(msg):
+        return True
+
+    if _TERM_DEFINITION_RE.search(msg) and _BTP_TERMS_LIKELY_RE.search(msg):
+        return True
+
+    if "devis" in msg_lower and ("explique" in msg_lower or "clarifie" in msg_lower):
+        return True
+
+    return False
+
+
+def _build_devis_terms_ui_reply(message: str) -> str:
+    payload_query = (message or "").strip()
+    lowered = payload_query.lower()
+    if any(k in lowered for k in ("termes", "mots", "jargon", "lexique", "glossaire")):
+        payload_query = ""
+
+    payload = {"query": payload_query}
+    payload_json = json.dumps(payload, ensure_ascii=False)
+
+    return (
+        "Je vous aide à comprendre les termes techniques qu’on voit souvent sur un devis BTP.\n\n"
+        "```devis-terms\n"
+        f"{payload_json}\n"
+        "```\n\n"
+        "Si vous avez votre devis sous les yeux, copiez/collez une ligne (ou joignez le PDF) "
+        "et je vous l’explique ligne par ligne."
+    )
 
 
 # ==================== ModÃ¨les Pydantic ====================
@@ -914,6 +970,9 @@ force_plan: {bool(payload.force_plan)}
     if last_assistant and reply_text.strip().lower() == last_assistant.strip().lower():
         reply_text = reply_text + " Je peux aussi vous donner un resume rapide du projet ou des prochaines etapes, dites-moi ce que vous preferez."
 
+    if is_client and _should_show_devis_terms_ui(payload.message):
+        reply_text = _build_devis_terms_ui_reply(payload.message)
+
     parsed["reply"] = reply_text
 
     return JSONResponse(parsed)
@@ -922,6 +981,16 @@ force_plan: {bool(payload.force_plan)}
 @app.post("/project-chat-client")
 async def project_chat_client(payload: ProjectChatInput):
     """Chat IA dédié aux particuliers (conseiller)."""
+    if _should_show_devis_terms_ui(payload.message):
+        return JSONResponse(
+            {
+                "reply": _build_devis_terms_ui_reply(payload.message),
+                "proposal": None,
+                "requires_devis": False,
+                "orchestrator": {"action": "answer", "needs_data": False, "reason": "devis_terms_ui"},
+            }
+        )
+
     # Fast answer sans données
     fast = _client_fast_reply(payload.message)
     keywords = ["projet", "planning", "tache", "tâche", "devis", "budget", "avancement", "membre", "message"]
