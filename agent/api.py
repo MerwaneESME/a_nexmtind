@@ -8,15 +8,40 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional
 
-from fastapi import FastAPI, UploadFile
+from fastapi import FastAPI, UploadFile, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from langchain_core.messages import HumanMessage, SystemMessage
 from pydantic import BaseModel, Field, validator
 
+# Rate limiting
+try:
+    from slowapi import Limiter, _rate_limit_exceeded_handler
+    from slowapi.util import get_remote_address
+    from slowapi.errors import RateLimitExceeded
+    RATE_LIMITING_AVAILABLE = True
+except ImportError:
+    RATE_LIMITING_AVAILABLE = False
+    logger.warning("slowapi not installed - rate limiting disabled. Run: pip install slowapi")
+
+# Prometheus metrics
+try:
+    from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
+    from .monitoring import agent_info, track_request
+    PROMETHEUS_AVAILABLE = True
+except ImportError:
+    PROMETHEUS_AVAILABLE = False
+    logger.warning("prometheus-client not installed - metrics disabled. Run: pip install prometheus-client")
+    # Dummy decorator when prometheus is not available
+    def track_request(endpoint: str):
+        def decorator(func):
+            return func
+        return decorator
+
 from api.chat import ChatInput as OptimizedChatInput
 from api.chat import handle_chat_non_stream, router as optimized_chat_router
+from api.feedback import router as feedback_router
 from .runtime import invoke_agent
 from .config import get_fast_llm, get_llm
 from .supabase_client import get_client, upsert_document
@@ -34,6 +59,15 @@ OUTPUT_DIR = Path(__file__).parent.parent / "output"
 
 app = FastAPI(title="Agent IA BTP V2 - Devis & Factures")
 
+# Configure rate limiting
+if RATE_LIMITING_AVAILABLE:
+    limiter = Limiter(key_func=get_remote_address, default_limits=["100/minute"])
+    app.state.limiter = limiter
+    app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+    logger.info("✅ Rate limiting enabled: 100 req/min global, custom limits on endpoints")
+else:
+    limiter = None
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins or ["*"],
@@ -49,6 +83,9 @@ if OUTPUT_DIR.exists():
 
 # Optimized /chat endpoint (JSON + SSE streaming)
 app.include_router(optimized_chat_router)
+
+# Feedback system endpoints
+app.include_router(feedback_router)
 
 
 def save_upload(file: UploadFile) -> str:
@@ -280,6 +317,9 @@ class ChatInput(BaseModel):
 
 class ProjectChatInput(BaseModel):
     project_id: str
+    context_type: Optional[Literal["project", "phase", "lot"]] = None
+    phase_id: Optional[str] = None
+    lot_id: Optional[str] = None
     user_id: str
     message: str
     history: Optional[List[ChatHistoryItem]] = None
@@ -631,6 +671,118 @@ def _build_project_context(sb, project_id: str, user_id: str) -> dict:
     }
 
 
+def _build_scoped_project_context(
+    sb,
+    *,
+    project_id: str,
+    user_id: str,
+    context_type: str | None,
+    phase_id: str | None,
+    lot_id: str | None,
+) -> dict:
+    """Scope the context to project / phase / lot while enforcing membership checks."""
+    ctx_type = (context_type or "").strip().lower() or "project"
+    if ctx_type not in {"project", "phase", "lot"}:
+        ctx_type = "project"
+
+    base = _build_project_context(sb, project_id, user_id)
+    if base.get("error"):
+        return base
+
+    # Default: full project context (backwards compatible)
+    if ctx_type == "project":
+        base["scope"] = {"type": "project", "project_id": project_id}
+        return base
+
+    # Phase scoped
+    if ctx_type == "phase":
+        if not phase_id:
+            return {"error": "not_allowed"}
+        phase_rows = (
+            sb.table("phases")
+            .select("id,project_id,name,description,phase_order,status,start_date,end_date,budget_estimated,budget_actual")
+            .eq("id", phase_id)
+            .limit(1)
+            .execute()
+        ).data or []
+        phase = phase_rows[0] if phase_rows else None
+        if not phase or str(phase.get("project_id")) != project_id:
+            return {"error": "not_allowed"}
+
+        lots = (
+            sb.table("lots")
+            .select("id,phase_id,name,description,lot_type,company_name,status,start_date,end_date,budget_estimated,budget_actual,progress_percentage")
+            .eq("phase_id", phase_id)
+            .execute()
+        ).data or []
+        lot_ids = [l.get("id") for l in lots if l.get("id")]
+
+        lot_tasks = []
+        quotes = []
+        invoices = []
+        if lot_ids:
+            lot_tasks = sb.table("lot_tasks").select("lot_id,title,status,due_date,completed_at").in_("lot_id", lot_ids).execute().data or []
+            quotes = sb.table("quotes").select("lot_id,quote_number,title,amount,status,issued_date").in_("lot_id", lot_ids).execute().data or []
+            invoices = sb.table("invoices").select("lot_id,invoice_number,title,amount,status,issued_date,due_date,paid_date").in_("lot_id", lot_ids).execute().data or []
+
+        return {
+            "scope": {"type": "phase", "project_id": project_id, "phase_id": phase_id},
+            "project": base.get("project"),
+            "participants": base.get("participants"),
+            "messages": [],
+            "phase": phase,
+            "lots": lots,
+            "tasks": lot_tasks,
+            "lot_tasks": lot_tasks,
+            "quotes": quotes,
+            "invoices": invoices,
+        }
+
+    # Lot scoped
+    if not lot_id:
+        return {"error": "not_allowed"}
+
+    lot_rows = (
+        sb.table("lots")
+        .select("id,phase_id,name,description,lot_type,company_name,status,start_date,end_date,budget_estimated,budget_actual,progress_percentage")
+        .eq("id", lot_id)
+        .limit(1)
+        .execute()
+    ).data or []
+    lot = lot_rows[0] if lot_rows else None
+    if not lot:
+        return {"error": "not_allowed"}
+
+    # Validate lot belongs to project via phase
+    phase_rows = (
+        sb.table("phases")
+        .select("id,project_id,name,phase_order,status")
+        .eq("id", lot.get("phase_id"))
+        .limit(1)
+        .execute()
+    ).data or []
+    phase = phase_rows[0] if phase_rows else None
+    if not phase or str(phase.get("project_id")) != project_id:
+        return {"error": "not_allowed"}
+
+    lot_tasks = sb.table("lot_tasks").select("title,status,due_date,completed_at").eq("lot_id", lot_id).execute().data or []
+    quotes = sb.table("quotes").select("quote_number,title,amount,status,issued_date").eq("lot_id", lot_id).execute().data or []
+    invoices = sb.table("invoices").select("invoice_number,title,amount,status,issued_date,due_date,paid_date").eq("lot_id", lot_id).execute().data or []
+
+    return {
+        "scope": {"type": "lot", "project_id": project_id, "phase_id": phase.get("id"), "lot_id": lot_id},
+        "project": base.get("project"),
+        "participants": base.get("participants"),
+        "messages": [],
+        "phase": phase,
+        "lot": lot,
+        "tasks": lot_tasks,
+        "lot_tasks": lot_tasks,
+        "quotes": quotes,
+        "invoices": invoices,
+    }
+
+
 class PrepareItem(BaseModel):
     description: str = Field(..., min_length=3, max_length=500)
     quantity: float = Field(..., gt=0)
@@ -827,13 +979,21 @@ async def chat_legacy(payload: ChatInput):
 
 
 @app.post("/project-chat")
+@track_request("project_chat")
 async def project_chat(payload: ProjectChatInput):
     """Chat IA par projet avec proposition de planning."""
     sb = get_client()
     if not sb:
         return JSONResponse({"reply": "Connexion Supabase indisponible.", "proposal": None, "requires_devis": True})
 
-    context = _build_project_context(sb, payload.project_id, payload.user_id)
+    context = _build_scoped_project_context(
+        sb,
+        project_id=payload.project_id,
+        user_id=payload.user_id,
+        context_type=payload.context_type,
+        phase_id=payload.phase_id,
+        lot_id=payload.lot_id,
+    )
     if context.get("error") == "not_allowed":
         return JSONResponse({"reply": "Acces refuse au projet.", "proposal": None, "requires_devis": True}, status_code=403)
 
@@ -1111,6 +1271,7 @@ async def pro_search(payload: ProSearchInput):
 
 
 @app.post("/validate-section")
+@track_request("validate_section")
 async def validate_section(payload: ChatInput):
     """Validation d'une section spÃ©cifique."""
     # Alias vers /chat avec mode validate
@@ -1160,6 +1321,7 @@ async def prefill(user_id: str | None = None, client_prefix: str | None = None):
 
 
 @app.post("/prepare-devis")
+@track_request("prepare_devis")
 async def prepare_devis(payload: PrepareDevisPayload):
     """PrÃ©paration complÃ¨te d'un devis."""
     base_thread_id = payload.thread_id or "session"
@@ -1306,3 +1468,27 @@ async def generate_checklist_pdf(payload: GenerateChecklistPdfPayload):
 async def health():
     """Health check."""
     return {"status": "ok", "version": "2.0"}
+
+
+@app.get("/metrics")
+async def metrics():
+    """Prometheus metrics endpoint.
+
+    Returns metrics in Prometheus text format for scraping by Prometheus server.
+    Includes:
+    - Request counts and duration by endpoint
+    - Cache hit/miss ratio
+    - LLM API calls and token usage
+    - Error counts by type
+    - Active request gauge
+    """
+    if not PROMETHEUS_AVAILABLE:
+        return Response(
+            content="# Prometheus metrics not available - prometheus-client not installed\n",
+            media_type="text/plain"
+        )
+
+    return Response(
+        content=generate_latest(),
+        media_type=CONTENT_TYPE_LATEST
+    )

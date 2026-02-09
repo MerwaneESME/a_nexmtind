@@ -1,5 +1,6 @@
 langchain>=0.1.0
 langgraph>=0.0.20
+langgraph-checkpoint-postgres>=0.0.1
 langchain-openai>=0.0.5
 fastapi>=0.104.0
 uvicorn[standard]>=0.24.0
@@ -19,3 +20,6 @@ pillow>=10.0.0
 redis>=5.0.0
 reportlab>=4.0.0
 openai>=1.0.0
+slowapi>=0.1.9
+tenacity>=8.2.0
+prometheus-client>=0.19.0

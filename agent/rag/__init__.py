@@ -9,11 +9,16 @@ exporting `SupabaseRAG`.
 """
 
 from .retriever import SupabaseRAG, get_corps_metier_retriever, get_retriever, is_corps_metier_question
+from .local_docs import cascade_search, detect_domain, ensure_domain_doc, LocalSnippet
 
 __all__ = [
     "SupabaseRAG",
     "get_retriever",
     "get_corps_metier_retriever",
     "is_corps_metier_question",
+    "cascade_search",
+    "detect_domain",
+    "ensure_domain_doc",
+    "LocalSnippet",
 ]
 

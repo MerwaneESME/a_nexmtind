@@ -18,8 +18,16 @@ from agent.cache import CacheEntry, get_chat_cache, normalize_question
 from agent.fast_path import try_fast_path
 from agent.graph import generate_response_with_actions, prepare_state, stream_synthesize, synthesize
 from agent.logging_config import logger
+from agent.monitoring import track_request, track_cache_hit
 from agent.utils.conversation_store import get_conversation_store
 
+# Rate limiting (imported from parent app)
+try:
+    from slowapi import Limiter
+    from slowapi.util import get_remote_address
+    limiter = Limiter(key_func=get_remote_address)
+except ImportError:
+    limiter = None
 
 router = APIRouter()
 
@@ -145,6 +153,7 @@ def _is_context_dependent(query: str, history: list[dict[str, Any]]) -> bool:
     return False
 
 
+@track_request("chat")
 async def handle_chat_non_stream(payload: ChatInput) -> dict[str, Any]:
     cache = get_chat_cache()
     normalized = normalize_question(payload.message)
@@ -170,6 +179,7 @@ async def handle_chat_non_stream(payload: ChatInput) -> dict[str, Any]:
     if cache.enabled and cacheable:
         hit = await cache.get(normalized)
         if hit:
+            track_cache_hit(True)
             meta = hit.meta or {}
             enriched = generate_response_with_actions(query=payload.message, response_text=hit.reply, metadata={"route": meta.get("route") or "cache"})
             return {
@@ -181,6 +191,8 @@ async def handle_chat_non_stream(payload: ChatInput) -> dict[str, Any]:
                 "totals": {},
                 "missing_fields": [],
             }
+        else:
+            track_cache_hit(False)
 
     user_role = str((payload.metadata or {}).get("user_role") or "")
     fast = await try_fast_path(
@@ -274,6 +286,7 @@ async def handle_chat_non_stream(payload: ChatInput) -> dict[str, Any]:
     }
 
 
+@track_request("chat_stream")
 async def handle_chat_stream(payload: ChatInput) -> AsyncIterator[str]:
     cache = get_chat_cache()
     normalized = normalize_question(payload.message)
@@ -298,6 +311,7 @@ async def handle_chat_stream(payload: ChatInput) -> AsyncIterator[str]:
     if cache.enabled and cacheable:
         hit = await cache.get(normalized)
         if hit:
+            track_cache_hit(True)
             enriched = generate_response_with_actions(query=payload.message, response_text=hit.reply, metadata={"route": "cache"})
             yield _sse("meta", {"cache": "hit"})
             yield _sse("delta", enriched["response"])
@@ -306,6 +320,8 @@ async def handle_chat_stream(payload: ChatInput) -> AsyncIterator[str]:
                 {"reply": enriched["response"], "quick_actions": enriched["quick_actions"], "conversation_id": conversation_id},
             )
             return
+        else:
+            track_cache_hit(False)
 
     user_role = str((payload.metadata or {}).get("user_role") or "")
     fast = await try_fast_path(
@@ -409,8 +425,12 @@ async def handle_chat_stream(payload: ChatInput) -> AsyncIterator[str]:
 
 
 @router.post("/chat")
+@limiter.limit("30/minute") if limiter else lambda f: f
 async def chat(payload: ChatInput, request: Request):
-    """Chat endpoint (JSON or streaming SSE)."""
+    """Chat endpoint (JSON or streaming SSE).
+
+    Rate limit: 30 requests per minute per IP address.
+    """
     # Allow cache clearing via query param without changing client payload.
     if _wants_clear_cache(payload, request):
         payload.clear_cache = True

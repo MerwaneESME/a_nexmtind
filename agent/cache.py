@@ -10,15 +10,22 @@ If REDIS_URL is not set (or `redis` is not installed), caching is disabled.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import unicodedata
 from dataclasses import dataclass
 from typing import Any, Optional
 
+logger = logging.getLogger(__name__)
+
 try:
     from redis.asyncio import Redis  # type: ignore
-except Exception:  # pragma: no cover
+except ImportError as exc:  # pragma: no cover
+    logger.warning("redis package not installed - caching disabled: %s", exc)
+    Redis = None  # type: ignore
+except Exception as exc:  # pragma: no cover
+    logger.error("Failed to import redis: %s", exc, exc_info=True)
     Redis = None  # type: ignore
 
 
@@ -71,7 +78,11 @@ class RedisChatCache:
             return None
         try:
             raw = await self._redis.get(self._key(normalized_question))
-        except Exception:
+        except (ConnectionError, TimeoutError) as exc:
+            logger.warning("Redis connection error during get: %s", exc)
+            return None
+        except Exception as exc:
+            logger.error("Unexpected error in cache.get: %s", exc, exc_info=True)
             return None
 
         if not raw:
@@ -79,7 +90,11 @@ class RedisChatCache:
 
         try:
             payload = json.loads(raw)
-        except Exception:
+        except json.JSONDecodeError as exc:
+            logger.warning("Invalid JSON in cache for key %s: %s", normalized_question[:50], exc)
+            return None
+        except Exception as exc:
+            logger.error("Unexpected error parsing cached JSON: %s", exc, exc_info=True)
             return None
 
         if not isinstance(payload, dict):

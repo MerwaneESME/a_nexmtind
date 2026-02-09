@@ -29,6 +29,8 @@ from .logging_config import logger
 from .prompts import GRAPH_ROUTER_PROMPT, SYNTHESIZER_SYSTEM_PROMPT
 from .rag_classifier import should_use_rag
 from .rag.retriever import get_corps_metier_retriever, get_general_retriever, is_corps_metier_question
+from .rag.local_docs import cascade_search, detect_domain
+from .rag.web_research import append_finding_to_doc, web_research
 from .tools import AVAILABLE_TOOLS
 
 
@@ -432,15 +434,56 @@ async def router_node(state: ChatState) -> ChatState:
     rag_filter_type: str | None = None
     rag_context: list[dict[str, Any]] = []
 
-    # ✅ Router métier: if the question is about a BTP trade, force the dedicated corpus retriever.
-    if is_corps_metier_question(message):
-        use_rag = True
-        rag_filter_type = "corps_metier"
+    # ✅ Stratégie en cascade (docs locales → docs connexes → web optionnel).
+    # Réservé aux questions "chat" sans tool (guidage technique).
+    if tool_call is None and intent == "chat" and message.strip():
+        domain = detect_domain(message)
+        if domain is None and is_corps_metier_question(message):
+            domain = "corps_de_metier"
+
+        local_snippets, consulted = cascade_search(message, domain=domain, max_docs=3)
+        if local_snippets:
+            use_rag = True
+            rag_filter_type = "local_docs"
+            rag_context = [
+                {
+                    "content": s.content,
+                    "metadata": {
+                        "source": s.source,
+                        "level": s.level,
+                        "heading": s.heading,
+                        "strategy": "cascade",
+                        "consulted": consulted,
+                    },
+                    "score": s.score,
+                }
+                for s in local_snippets[:4]
+            ]
+        else:
+            finding = await web_research(message, max_results=3)
+            if finding:
+                updated_doc = append_finding_to_doc(domain=domain or "corps_de_metier", finding=finding)
+                use_rag = True
+                rag_filter_type = "web"
+                rag_context = [
+                    {
+                        "content": (finding.answer or "").strip(),
+                        "metadata": {
+                            "source": "web",
+                            "level": 3,
+                            "strategy": "cascade",
+                            "query": finding.query,
+                            "updated_doc": updated_doc,
+                            "sources": finding.sources,
+                        },
+                        "score": None,
+                    }
+                ]
 
     # If heuristics didn't decide, ask the fast router LLM.
     # When the trade router forces `corps_metier` RAG, skip the router LLM (lower latency)
     # and avoid letting it override the forced RAG decision.
-    if tool_call is None and rag_filter_type != "corps_metier":
+    if tool_call is None and rag_filter_type not in {"local_docs", "web"}:
         llm = get_fast_llm(temperature=0.0).bind(max_tokens=140)
         summary = _summarize_structured_payload(structured)
         file_path = _extract_first_file(metadata)
@@ -480,6 +523,11 @@ async def router_node(state: ChatState) -> ChatState:
             if rag_filter_type is None:
                 use_rag = bool(llm_use_rag) if isinstance(llm_use_rag, bool) else False
 
+    # Enforce strict cascade: for pure "chat" without tools, do not fall back to generic Supabase RAG.
+    # Local docs (N1/N2) + optional web (N3) are handled above.
+    if tool_call is None and intent == "chat" and rag_filter_type is None:
+        use_rag = False
+
     # Final RAG gate via dedicated classifier (only for general RAG).
     if use_rag and rag_filter_type is None:
         try:
@@ -488,7 +536,7 @@ async def router_node(state: ChatState) -> ChatState:
             use_rag = False
 
     # Retrieval (optional, strict)
-    if use_rag:
+    if use_rag and not rag_context and rag_filter_type not in {"local_docs", "web"}:
         retriever = (
             get_corps_metier_retriever(k=int(os.getenv("RAG_TOP_K", "4")), score_threshold=float(os.getenv("RAG_THRESHOLD", "0.75")))
             if rag_filter_type == "corps_metier"
@@ -579,10 +627,22 @@ def _build_messages_for_synthesis(state: ChatState) -> list[BaseMessage]:
         for doc in rag_context[:4]:
             content = doc.get("content")
             if isinstance(content, str) and content.strip():
+                meta = doc.get("metadata") if isinstance(doc.get("metadata"), dict) else {}
+                src = str(meta.get("source") or "").strip()
+                lvl = meta.get("level")
+                heading = str(meta.get("heading") or "").strip()
+                prefix = ""
+                if src:
+                    prefix = f"({src}"
+                    if lvl is not None:
+                        prefix += f" | niveau {lvl}"
+                    if heading:
+                        prefix += f" | {heading}"
+                    prefix += ") "
                 snippet = content.strip().replace("\n", " ")
                 if len(snippet) > 350:
                     snippet = snippet[:350] + "…"
-                snippets.append(f"- {snippet}")
+                snippets.append(f"- {prefix}{snippet}")
         if snippets:
             context_lines.append("Extraits pertinents:\n" + "\n".join(snippets))
 

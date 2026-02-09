@@ -6,6 +6,11 @@ from typing import Annotated, Any, Dict, List, Literal, Optional, TypedDict
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.prompts import ChatPromptTemplate
 from langgraph.checkpoint.memory import MemorySaver
+try:
+    from langgraph.checkpoint.postgres import PostgresSaver
+    POSTGRES_AVAILABLE = True
+except ImportError:
+    POSTGRES_AVAILABLE = False
 from langgraph.graph import END, StateGraph
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode
@@ -13,6 +18,9 @@ from langgraph.prebuilt import ToolNode
 from .config import SYSTEM_PROMPT, get_llm, get_fast_llm
 from .logging_config import logger
 from .rag import SupabaseRAG
+from .rag.local_docs import cascade_search, detect_domain
+from .rag.retriever import is_corps_metier_question
+from .rag.web_research import append_finding_to_doc, web_research_sync
 from .tools import AVAILABLE_TOOLS, calculate_totals_tool, clean_lines_tool, validate_devis_tool
 
 PROMPTS_DIR = Path(__file__).parent.parent / "prompts"
@@ -258,6 +266,59 @@ def rag_retriever_node(state: AgentState) -> AgentState:
     intent = state.get("intent") or (state.get("normalized") or {}).get("intent") or "chat"
     normalized = state.get("normalized") or {}
     payload = normalized.get("structured_payload", {})
+
+    # ✅ Stratégie en cascade (docs locales → docs connexes → web optionnel).
+    # Appliqué aux questions "chat" sans payload structuré.
+    if intent == "chat" and not payload:
+        messages = state.get("messages") or []
+        last_user_text = ""
+        for m in reversed(messages):
+            if isinstance(m, HumanMessage):
+                last_user_text = str(getattr(m, "content", "") or "").strip()
+                if last_user_text:
+                    break
+
+        if last_user_text:
+            domain = detect_domain(last_user_text)
+            if domain is None and is_corps_metier_question(last_user_text):
+                domain = "corps_de_metier"
+
+            local_snippets, consulted = cascade_search(last_user_text, domain=domain, max_docs=3)
+            if local_snippets:
+                rag_results = [
+                    {
+                        "content": s.content,
+                        "metadata": {
+                            "source": s.source,
+                            "level": s.level,
+                            "heading": s.heading,
+                            "strategy": "cascade",
+                            "consulted": consulted,
+                        },
+                        "score": s.score,
+                    }
+                    for s in local_snippets[:4]
+                ]
+                return {"rag_context": rag_results, "supabase_context": rag_results}
+
+            finding = web_research_sync(last_user_text, max_results=3)
+            if finding:
+                updated_doc = append_finding_to_doc(domain=domain or "corps_de_metier", finding=finding)
+                rag_results = [
+                    {
+                        "content": (finding.answer or "").strip(),
+                        "metadata": {
+                            "source": "web",
+                            "level": 3,
+                            "strategy": "cascade",
+                            "query": finding.query,
+                            "updated_doc": updated_doc,
+                            "sources": finding.sources,
+                        },
+                        "score": None,
+                    }
+                ]
+                return {"rag_context": rag_results, "supabase_context": rag_results}
     
     # ✅ CONDITIONS STRICTES pour appeler le RAG (évite 70% des appels)
     needs_rag = (
@@ -710,8 +771,48 @@ INSTRUCTIONS:
 
 # ==================== Construction du Graph OPTIMISÉ ====================
 
+def _get_checkpointer():
+    """Get checkpointer with PostgreSQL primary, MemorySaver fallback.
+
+    Returns:
+        PostgresSaver if database credentials are configured, otherwise MemorySaver.
+    """
+    from .config import get_postgres_url
+
+    postgres_url = get_postgres_url()
+
+    if postgres_url and POSTGRES_AVAILABLE:
+        try:
+            # PostgresSaver.from_conn_string returns a sync connection
+            # Tables are created automatically on first use
+            checkpointer = PostgresSaver.from_conn_string(postgres_url)
+            logger.info("✅ PostgreSQL checkpointer enabled (persistent conversation history)")
+            return checkpointer
+        except Exception as exc:
+            logger.warning(
+                "Failed to connect to PostgreSQL checkpoint store: %s. "
+                "Falling back to MemorySaver (conversations will be lost on restart).",
+                exc,
+                exc_info=True
+            )
+    else:
+        if not POSTGRES_AVAILABLE:
+            logger.warning(
+                "langgraph-checkpoint-postgres not installed. Using MemorySaver "
+                "(conversations will be lost on restart). Install with: pip install langgraph-checkpoint-postgres"
+            )
+        else:
+            logger.warning(
+                "No DATABASE_URL configured. Using MemorySaver "
+                "(conversations will be lost on restart)."
+            )
+
+    # Fallback to in-memory
+    return MemorySaver()
+
+
 def build_graph():
-    """Construit le graph LangGraph - VERSION OPTIMISÉE (sans reflection)."""
+    """Construit le graph LangGraph - VERSION OPTIMISÉE avec persistance PostgreSQL."""
     builder = StateGraph(AgentState)
     
     # Ajouter les nœuds
@@ -749,10 +850,14 @@ def build_graph():
     
     # ✅ FIN directe après synthesizer (plus de reflection)
     builder.add_edge("llm_synthesizer", END)
-    
+
+    # Configure checkpointer avec fallback
+    checkpointer = _get_checkpointer()
+
     logger.info("🚀 Graph optimisé construit (fast_path + skip RAG + no reflection)")
-    
-    return builder.compile(checkpointer=MemorySaver())
+    logger.info("📊 Checkpointer: %s", type(checkpointer).__name__)
+
+    return builder.compile(checkpointer=checkpointer)
 
 
 agent_graph = build_graph()
