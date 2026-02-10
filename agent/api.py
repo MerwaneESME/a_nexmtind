@@ -43,7 +43,7 @@ from api.chat import ChatInput as OptimizedChatInput
 from api.chat import handle_chat_non_stream, router as optimized_chat_router
 from api.feedback import router as feedback_router
 from .runtime import invoke_agent
-from .config import get_fast_llm, get_llm
+from .config import DEFAULT_MODEL, get_fast_llm, get_llm
 from .supabase_client import get_client, upsert_document
 from .tools import calculate_totals_tool, clean_lines_tool, supabase_lookup_tool, validate_devis_tool
 from .logging_config import logger
@@ -211,11 +211,12 @@ def _format_ai_reply(reply: Any) -> str:
 def _client_fast_reply(message: str) -> str | None:
     """Réponse rapide conseiller (client), sans accès Supabase."""
     system_prompt = (
-        "Tu es un conseiller BTP pour un particulier. "
-        "Réponds en français, en 2-3 phrases maximum, avec des mots simples. "
-        "Si on te demande des étapes, donne 3 étapes courtes. "
-        "Si on te demande d'expliquer un terme, donne une définition simple et un exemple concret. "
-        "Ne pose pas de question."
+        "Tu es un conseiller BTP bienveillant pour un particulier. "
+        "Reponds en francais, en 3-5 phrases claires avec des mots simples. "
+        "Donne toujours un exemple concret du quotidien pour illustrer. "
+        "Si on te demande des etapes, donne 3-5 etapes courtes avec une estimation de duree. "
+        "Si on te demande d'expliquer un terme, donne une definition simple, un exemple, et pourquoi c'est important. "
+        "Termine par une question ou une proposition pour continuer la conversation."
     )
     try:
         llm = get_fast_llm()
@@ -229,10 +230,12 @@ def _client_fast_reply(message: str) -> str | None:
 def _pro_fast_reply(message: str) -> str | None:
     """Réponse rapide pour un professionnel (sans workflow complet)."""
     system_prompt = (
-        "Tu es un assistant BTP pour un professionnel. "
-        "Réponds directement à la question POSÉE, sans te présenter et sans lister toutes tes capacités. "
-        "Donne une réponse concrète en français, structurée en 3 à 5 puces maximum. "
-        "Si la question porte sur les matériaux, propose des familles de matériaux avec avantages/inconvénients simples. "
+        "Tu es un assistant BTP expert pour un professionnel. "
+        "Reponds directement a la question POSEE, sans te presenter et sans lister toutes tes capacites. "
+        "Donne une reponse structuree et detaillee en 5-8 phrases. "
+        "Cite les references DTU applicables si pertinent. "
+        "Si la question porte sur les materiaux, propose des familles avec avantages/inconvenients et fourchettes de prix. "
+        "Termine toujours par une action concrete ou une recommandation suivante. "
         "Ne parle pas du formulaire, ne parle pas de champs manquants, ne renvoie pas de JSON."
     )
     try:
@@ -1065,11 +1068,41 @@ Regles:
 - Le planning ne doit pas commencer avant la date/heure actuelles.
 - Si une tache est prevue aujourd'hui, son heure de debut doit etre apres l'heure actuelle, sinon decale au lendemain.
 Style de reponse:
-- Format conseille: 1 phrase de resume + 3 puces maximum.
-- Reponds en francais clair, concis (max 8 lignes pour les questions simples, jusqu'a 12 lignes pour les explications detaillees).
+- Adapte la longueur a la complexite de la question :
+  * Questions simples (bonjour, merci, oui/non) : 2-4 phrases.
+  * Questions sur l'avancement, le budget, les travaux : 6-12 phrases avec TOUS les details disponibles.
+  * Analyses ou recommandations : 8-15 phrases structurees.
 - Ne renvoie jamais d'identifiants internes ou de JSON dans reply.
 - Si l'utilisateur demande un autre projet, propose d'ouvrir l'autre projet ou d'en creer un nouveau.
 - Si la derniere reponse assistant est similaire a ce que tu allais dire, reformule en apportant une nouvelle information/action.
+
+EXPLOITATION OBLIGATOIRE DU CONTEXTE:
+- DEVIS: Si has_devis=True, cite les postes principaux avec montants exacts (utilise devis_items).
+  Calcule et mentionne le total TTC. Identifie les 3 postes les plus chers.
+  Ne demande JAMAIS d'ajouter un devis s'il existe deja.
+- TACHES: identifie les taches en retard (end_date < date actuelle ET status != done/completed).
+  Liste les taches en cours avec leurs dates. Felicite pour les taches terminees.
+  Donne le ratio taches terminees / total.
+- BUDGET: Si budget_estimated et budget_actual sont disponibles dans les phases/lots,
+  compare-les et signale tout ecart superieur a 10%.
+- MEMBRES: Mentionne les membres actifs quand c'est pertinent (ex: qui est responsable de quoi).
+- MESSAGES RECENTS: Ne repete JAMAIS ce qui a deja ete dit dans l'historique des 5 derniers messages.
+
+STRUCTURE ADAPTEE AU TYPE DE QUESTION:
+- Avancement → Resume situation + taches en cours avec dates + prochaines etapes + date estimee de fin
+- Budget → Montants precis du devis + ecarts budget estime/reel + recommandations d'economie
+- Travaux → Description technique + duree estimee + materiaux + points d'attention qualite
+- Question generale → Synthese du projet + 2-3 axes d'action prioritaires
+
+ENGAGEMENT UTILISATEUR (OBLIGATOIRE):
+Termine TOUJOURS ta reponse par :
+- Une question pertinente basee sur le contexte du projet, OU
+- Une proposition d'action concrete que l'utilisateur peut faire maintenant, OU
+- Un point d'attention important a ne pas oublier.
+
+Ajoute aussi une cle "suggested_questions" dans le JSON avec 2-3 questions pertinentes
+que l'utilisateur pourrait se poser ensuite.
+Format JSON attendu: {{ "reply": "...", "proposal": null, "requires_devis": false, "suggested_questions": ["q1", "q2", "q3"] }}
 """
     context_summary = _format_project_context(context)
 
@@ -1118,6 +1151,7 @@ force_plan: {bool(payload.force_plan)}
 
     parsed.setdefault("reply", "Je peux proposer un planning base sur le devis.")
     parsed.setdefault("proposal", None)
+    parsed.setdefault("suggested_questions", None)
     parsed["requires_devis"] = False if has_devis else parsed.get("requires_devis", True)
 
     if isinstance(parsed.get("proposal"), dict):
@@ -1466,8 +1500,17 @@ async def generate_checklist_pdf(payload: GenerateChecklistPdfPayload):
 
 @app.get("/health")
 async def health():
-    """Health check."""
-    return {"status": "ok", "version": "2.0"}
+    """Health check pour monitoring et debugging."""
+    sb_ok = get_client() is not None
+    model = os.getenv("LLM_PIPELINE_MODEL", DEFAULT_MODEL)
+    return {
+        "status": "ok",
+        "database": "connected" if sb_ok else "disconnected",
+        "model": model,
+        "max_tokens": int(os.getenv("LLM_PIPELINE_MAX_TOKENS", "2000")),
+        "rag_top_k": int(os.getenv("RAG_TOP_K", "4")),
+        "version": "2.1.0",
+    }
 
 
 @app.get("/metrics")

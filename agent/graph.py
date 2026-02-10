@@ -646,6 +646,15 @@ def _build_messages_for_synthesis(state: ChatState) -> list[BaseMessage]:
         if snippets:
             context_lines.append("Extraits pertinents:\n" + "\n".join(snippets))
 
+    # Fallback si RAG activé mais aucun résultat trouvé
+    if not rag_context and state.get("use_rag"):
+        context_lines.append(
+            "Note: La recherche documentaire n'a pas trouve de document specifique pour cette question. "
+            "Reponds avec tes connaissances BTP generales en le precisant clairement dans ta reponse "
+            "(ex: 'D'apres les pratiques courantes du BTP, ...'). "
+            "Si la question necessite des donnees specifiques au projet, invite l'utilisateur a fournir plus de details."
+        )
+
     if context_lines:
         messages.append(SystemMessage(content="\n".join(context_lines)))
 
@@ -676,8 +685,8 @@ def _get_synth_llm(streaming: bool):
     fallback_model = os.getenv("LLM_PIPELINE_FALLBACK_MODEL", FALLBACK_MODEL).strip() or FALLBACK_MODEL
     # Completion token budget for the final answer.
     # Default raised to avoid truncated structured answers (finish_reason="length").
-    max_tokens = int(os.getenv("LLM_PIPELINE_MAX_TOKENS", "1500"))
-    max_tokens = max(128, min(max_tokens, 2048))
+    max_tokens = int(os.getenv("LLM_PIPELINE_MAX_TOKENS", "2000"))
+    max_tokens = max(128, min(max_tokens, 4096))
 
     def is_reasoning_model(name: str) -> bool:
         lowered = (name or "").lower()
@@ -761,10 +770,10 @@ def _log_llm_request_config(*, messages: list[BaseMessage], state: ChatState, la
     model_name = os.getenv("LLM_PIPELINE_MODEL", DEFAULT_MODEL).strip() or DEFAULT_MODEL
     raw_env_max = os.getenv("LLM_PIPELINE_MAX_TOKENS")
     try:
-        max_tokens = int(raw_env_max or "1500")
+        max_tokens = int(raw_env_max or "2000")
     except Exception:
-        max_tokens = 1500
-    max_tokens = max(128, min(max_tokens, 2048))
+        max_tokens = 2000
+    max_tokens = max(128, min(max_tokens, 4096))
 
     system_len = len(SYNTHESIZER_SYSTEM_PROMPT or "")
     total_chars = 0

@@ -130,7 +130,14 @@ def fast_path_node(state: AgentState) -> AgentState:
         try:
             llm = get_fast_llm(temperature=0.3)
             result = llm.invoke([
-                SystemMessage(content="Tu es un assistant BTP. Réponds en 1-2 phrases max, de manière amicale."),
+                SystemMessage(content=(
+                    "Tu es un assistant BTP expert et pedagogue.\n"
+                    "Adapte ta reponse au type de question :\n"
+                    "- Salutations (bonjour, merci) : 1-2 phrases + propose comment tu peux aider.\n"
+                    "- Definitions BTP (c'est quoi un DTU, ragreage, etc.) : donne la definition claire + un exemple concret de chantier + pourquoi c'est important (3-5 phrases).\n"
+                    "- Questions simples sur le BTP : reponds en 3-5 phrases avec des details pratiques.\n"
+                    "Reponds toujours en francais, de maniere amicale et professionnelle."
+                )),
                 HumanMessage(content=content)
             ])
             reply = getattr(result, "content", str(result)).strip()
@@ -672,16 +679,29 @@ Donnees du formulaire (si disponibles):
 - Lignes: {len(payload.get('line_items', []))} produits
 
 Regles:
-1. "reply" est une reponse conversationnelle claire et courte (2-3 phrases MAX).
-2. "todo" est une liste d'actions courtes (max 3). Laisse vide si pas besoin.
-3. N'invente rien.
+1. "reply" doit etre UTILE, DETAILLEE et ACTIONNABLE :
+   - Salutations ou courtoisie : 1-2 phrases suffisent.
+   - Questions techniques, projet ou devis : 5-10 phrases avec DETAILS CONCRETS
+     (chiffres exacts, dates, noms de postes, materiaux, montants du devis si disponibles).
+   - TOUJOURS terminer par une question pertinente OU une proposition d'action concrete
+     pour engager l'utilisateur.
+2. "todo" est une liste d'actions concretes et specifiques (max 5).
+   Chaque action doit etre faisable immediatement par l'utilisateur.
+   Exemples: "Renseigner l'adresse du client dans le formulaire", "Verifier le taux de TVA sur la ligne 3".
+3. N'invente rien mais EXPLOITE A FOND toutes les donnees disponibles dans le contexte.
+4. Si un contexte documentaire (rag_context) est fourni, cite la source et donne des details techniques.
 """
     elif intent == "validate":
         system_instruction = f"""
 Tu valides une section du devis. Reponds en JSON strict avec {{ "reply": "...", "todo": [] }} uniquement.
 Ne renvoie pas de JSON technique (pas de champs du type customer.address).
 Priorite: utilise section_issues si present, sinon base-toi sur missing_fields.
-Reply doit faire 2-3 phrases MAX.
+
+Regles pour reply:
+- Liste CHAQUE probleme trouve avec sa correction suggeree.
+- Sois precis: cite le champ exact, la valeur actuelle, et ce qu'il faudrait corriger.
+- Si tout est correct, confirme-le avec les points forts du devis.
+- Adapte la longueur au nombre de problemes (1 phrase si tout est ok, 5-10 phrases si plusieurs corrections).
 """
     else:
         system_instruction = f"""

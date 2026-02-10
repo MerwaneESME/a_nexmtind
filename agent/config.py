@@ -52,7 +52,7 @@ def get_postgres_url() -> str | None:
     return f"postgresql://postgres:{db_password}@{db_host}:{db_port}/{db_name}"
 
 
-DEFAULT_MODEL = os.getenv("LLM_MODEL", "gpt-5-mini")
+DEFAULT_MODEL = os.getenv("LLM_MODEL", "gpt-4o-mini")
 FALLBACK_MODEL = os.getenv("LLM_FALLBACK_MODEL", "gpt-4o-mini")
 FAST_MODEL = os.getenv("LLM_FAST_MODEL", "gpt-4o-mini")  # Modèle rapide et économique
 FAST_FALLBACK_MODEL = os.getenv("LLM_FAST_FALLBACK_MODEL", "gpt-3.5-turbo")
