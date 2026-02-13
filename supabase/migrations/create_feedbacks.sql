@@ -25,6 +25,9 @@ CREATE INDEX IF NOT EXISTS idx_fb_created ON public.feedbacks(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_fb_rating ON public.feedbacks(rating);
 
 ALTER TABLE public.feedbacks ENABLE ROW LEVEL SECURITY;
-CREATE POLICY IF NOT EXISTS "Allow insert for all" ON public.feedbacks FOR INSERT WITH CHECK (true);
-CREATE POLICY IF NOT EXISTS "Allow read for all" ON public.feedbacks FOR SELECT USING (true);
-CREATE POLICY IF NOT EXISTS "Allow delete for all" ON public.feedbacks FOR DELETE USING (true);
+DROP POLICY IF EXISTS "Allow insert for all" ON public.feedbacks;
+CREATE POLICY "Allow insert for all" ON public.feedbacks FOR INSERT WITH CHECK (true);
+DROP POLICY IF EXISTS "Allow read for all" ON public.feedbacks;
+CREATE POLICY "Allow read for all" ON public.feedbacks FOR SELECT USING (true);
+DROP POLICY IF EXISTS "Allow delete for all" ON public.feedbacks;
+CREATE POLICY "Allow delete for all" ON public.feedbacks FOR DELETE USING (true);

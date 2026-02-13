@@ -454,9 +454,13 @@ def _extract_time_range(description: str | None) -> str | None:
     if not description:
         return None
     match = re.match(r"^\[\[time:([^\]]+)\]\]\s*(.*)$", description)
-    if not match:
-        return None
-    return match.group(1).strip() or None
+    if match:
+        return match.group(1).strip() or None
+    # Fallback: [HH:MM-HH:MM] format from AI proposals
+    match_alt = re.match(r"^\[(\d{2}:\d{2}-\d{2}:\d{2})\]\s*", description)
+    if match_alt:
+        return match_alt.group(1).strip() or None
+    return None
 
 
 def _format_devis_title(metadata: dict | None) -> str | None:
@@ -473,6 +477,8 @@ def _format_project_context(context: dict) -> str:
     project = context.get("project") or {}
     participants = context.get("participants") or []
     tasks = context.get("tasks") or []
+    lots = context.get("lots") or []
+    lot_tasks = context.get("lot_tasks") or []
     learning_stats = context.get("learning_stats") or []
     devis = context.get("devis") or []
     devis_items = context.get("devis_items") or []
@@ -491,7 +497,7 @@ def _format_project_context(context: dict) -> str:
 
     if participants:
         lines.append("Participants:")
-        for participant in participants[:5]:
+        for participant in participants[:10]:
             profile = participant.get("profiles") or {}
             name = profile.get("full_name") or profile.get("company_name") or participant.get("invited_email")
             role = participant.get("role") or "membre"
@@ -499,8 +505,8 @@ def _format_project_context(context: dict) -> str:
                 lines.append(f"- {name} ({role})")
 
     if tasks:
-        lines.append("Taches en cours:")
-        for task in tasks[:6]:
+        lines.append("Taches du projet:")
+        for task in tasks[:10]:
             time_range = _extract_time_range(task.get("description"))
             period = task.get("start_date") or ""
             if task.get("end_date") and task.get("end_date") != task.get("start_date"):
@@ -509,6 +515,45 @@ def _format_project_context(context: dict) -> str:
             status = task.get("status") or ""
             time_part = f" ({time_range})" if time_range else ""
             lines.append(f"- {label} | {status} | {period}{time_part}".strip())
+
+    # Interventions (lots) and their tasks
+    if lots:
+        lot_tasks_by_lot: dict[str, list] = {}
+        for lt in lot_tasks:
+            lid = lt.get("lot_id")
+            if lid:
+                lot_tasks_by_lot.setdefault(lid, []).append(lt)
+
+        lines.append("Interventions:")
+        for lot in lots:
+            lid = lot.get("id")
+            lot_name = lot.get("name") or "Intervention"
+            company = lot.get("company_name") or ""
+            status = lot.get("status") or ""
+            start = lot.get("start_date") or ""
+            end = lot.get("end_date") or ""
+            budget_est = lot.get("budget_estimated")
+            budget_act = lot.get("budget_actual")
+            period = f"{start}" + (f" -> {end}" if end and end != start else "")
+            budget_str = ""
+            if budget_est:
+                budget_str = f" | Budget: {budget_act or 0}/{budget_est} EUR"
+            company_str = f" | Entreprise: {company}" if company else ""
+            lines.append(f"- {lot_name} | {status} | {period}{company_str}{budget_str}")
+
+            # List tasks for this intervention
+            tasks_for_lot = lot_tasks_by_lot.get(lid, [])
+            if tasks_for_lot:
+                for lt in tasks_for_lot[:15]:
+                    t_title = lt.get("title") or "Tache"
+                    t_status = lt.get("status") or "todo"
+                    t_due = lt.get("due_date") or ""
+                    t_desc = lt.get("description") or ""
+                    time_range = _extract_time_range(t_desc)
+                    time_part = f" ({time_range})" if time_range else ""
+                    lines.append(f"  - {t_title} | {t_status} | {t_due}{time_part}")
+            else:
+                lines.append("  (aucune tache)")
 
     if devis:
         lines.append("Devis:")
@@ -663,11 +708,41 @@ def _build_project_context(sb, project_id: str, user_id: str) -> dict:
                 .execute()
             ).data or []
 
+    # Fetch interventions (lots) and their tasks across all phases
+    phases = (
+        sb.table("phases")
+        .select("id,name,status")
+        .eq("project_id", project_id)
+        .execute()
+    ).data or []
+    phase_ids = [p.get("id") for p in phases if p.get("id")]
+
+    lots = []
+    lot_tasks = []
+    if phase_ids:
+        lots = (
+            sb.table("lots")
+            .select("id,phase_id,name,description,lot_type,company_name,status,start_date,end_date,budget_estimated,budget_actual,progress_percentage")
+            .in_("phase_id", phase_ids)
+            .execute()
+        ).data or []
+        lot_ids = [l.get("id") for l in lots if l.get("id")]
+        if lot_ids:
+            lot_tasks = (
+                sb.table("lot_tasks")
+                .select("lot_id,title,description,status,due_date,assigned_to,completed_at")
+                .in_("lot_id", lot_ids)
+                .order("due_date")
+                .execute()
+            ).data or []
+
     return {
         "project": project,
         "participants": participants,
         "messages": list(reversed(messages)),
         "tasks": tasks,
+        "lots": lots,
+        "lot_tasks": lot_tasks,
         "learning_stats": learning_stats,
         "devis": devis,
         "devis_items": devis_items,
@@ -837,9 +912,10 @@ def _session_thread_id(thread_id: str, mode: str) -> str:
 
 # ==================== Endpoints API ====================
 
+# DEPRECATED — à supprimer quand le frontend legacy (static/index.html) sera retiré.
 @app.post("/chat-legacy")
 async def chat_legacy(payload: ChatInput):
-    """Chat conversationnel avec donnÃ©es du formulaire."""
+    """Chat conversationnel avec données du formulaire (legacy)."""
     # ==================== Fast path: aide generique pour faire un devis ====================
     text_lower = (payload.message or "").lower()
     meta_dict = payload.metadata if isinstance(payload.metadata, dict) else {}
@@ -1059,10 +1135,11 @@ Guidance specifique pour assistant professionnel:
 {client_guidance}
 {pro_guidance}
 Regles:
-- Utilise uniquement le contexte fourni (projet, devis, messages, participants, taches).
+- Utilise uniquement le contexte fourni (projet, interventions, taches, devis, messages, participants).
 - Ne parle jamais d'un autre projet.
 - Propose un planning uniquement si l'utilisateur le demande ou si force_plan est vrai.
-- has_devis={has_devis}. Si has_devis=True, ne demande pas d'ajouter un devis. Si has_devis=False, tu peux demander un devis mais une seule fois.
+- has_devis={has_devis}. Si has_devis=True, le devis est dans le contexte. Utilise-le directement, ne demande JAMAIS a l'utilisateur de te le fournir.
+- Si has_devis=False, il n'y a PAS de devis dans ce projet. Ne demande PAS a l'utilisateur de te fournir un devis. Concentre-toi sur les donnees disponibles (interventions, taches, planning, membres, budget des interventions). Tu peux mentionner l'absence de devis UNE SEULE fois si c'est pertinent, puis passe a autre chose.
 - Reponds en JSON strict avec les cles: reply, proposal, requires_devis.
 - proposal est null ou {{ "summary": "...", "tasks": [ {{ "name": "", "description": "", "start_date": "YYYY-MM-DD", "end_date": "YYYY-MM-DD", "time_range": "HH:MM-HH:MM" }} ] }}.
 - Le planning ne doit pas commencer avant la date/heure actuelles.
@@ -1077,13 +1154,19 @@ Style de reponse:
 - Si la derniere reponse assistant est similaire a ce que tu allais dire, reformule en apportant une nouvelle information/action.
 
 EXPLOITATION OBLIGATOIRE DU CONTEXTE:
-- DEVIS: Si has_devis=True, cite les postes principaux avec montants exacts (utilise devis_items).
+- DEVIS: Si has_devis=True, tu as DEJA acces au devis dans le contexte ci-dessous.
+  Ne demande JAMAIS a l'utilisateur de te fournir le devis - tu l'as deja.
+  Cite les postes principaux avec montants exacts (utilise devis_items).
   Calcule et mentionne le total TTC. Identifie les 3 postes les plus chers.
-  Ne demande JAMAIS d'ajouter un devis s'il existe deja.
-- TACHES: identifie les taches en retard (end_date < date actuelle ET status != done/completed).
+  Si has_devis=False, il n'y a PAS de devis. Ne demande PAS le devis. Reponds avec les autres donnees disponibles (interventions, taches, budget interventions, membres).
+- INTERVENTIONS: Le contexte contient les interventions (lots) du projet et leurs taches.
+  Chaque intervention a un nom, un statut, des dates, un budget, et une liste de taches.
+  Utilise ces informations pour repondre aux questions sur le planning, l'avancement, les taches prevues.
+  Si on demande les taches d'une date specifique, consulte les taches des interventions (due_date).
+- TACHES: identifie les taches en retard (end_date/due_date < date actuelle ET status != done/completed).
   Liste les taches en cours avec leurs dates. Felicite pour les taches terminees.
-  Donne le ratio taches terminees / total.
-- BUDGET: Si budget_estimated et budget_actual sont disponibles dans les phases/lots,
+  Donne le ratio taches terminees / total (projet + interventions).
+- BUDGET: Si budget_estimated et budget_actual sont disponibles dans les interventions,
   compare-les et signale tout ecart superieur a 10%.
 - MEMBRES: Mentionne les membres actifs quand c'est pertinent (ex: qui est responsable de quoi).
 - MESSAGES RECENTS: Ne repete JAMAIS ce qui a deja ete dit dans l'historique des 5 derniers messages.
@@ -1096,12 +1179,15 @@ STRUCTURE ADAPTEE AU TYPE DE QUESTION:
 
 ENGAGEMENT UTILISATEUR (OBLIGATOIRE):
 Termine TOUJOURS ta reponse par :
-- Une question pertinente basee sur le contexte du projet, OU
 - Une proposition d'action concrete que l'utilisateur peut faire maintenant, OU
 - Un point d'attention important a ne pas oublier.
 
-Ajoute aussi une cle "suggested_questions" dans le JSON avec 2-3 questions pertinentes
-que l'utilisateur pourrait se poser ensuite.
+SUGGESTED_QUESTIONS (OBLIGATOIRE):
+Ajoute une cle "suggested_questions" dans le JSON avec 2-3 boutons d'action rapide pour l'utilisateur.
+IMPORTANT: Ces questions sont des COMMANDES que l'UTILISATEUR te donne (pas des questions que TU poses).
+Elles doivent etre formulees du point de vue de l'utilisateur, comme s'il te parlait.
+Exemples corrects: "Analyse mon devis", "Montre les taches en retard", "Propose un planning pour cette semaine", "Quel est l'avancement du projet ?", "Compare le budget prevu et reel"
+Exemples INCORRECTS (ne fais JAMAIS ca): "Quels sont les postes de votre devis ?", "Avez-vous des preoccupations ?", "Souhaitez-vous des recommandations ?"
 Format JSON attendu: {{ "reply": "...", "proposal": null, "requires_devis": false, "suggested_questions": ["q1", "q2", "q3"] }}
 """
     context_summary = _format_project_context(context)

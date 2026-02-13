@@ -48,4 +48,5 @@ ON CONFLICT DO NOTHING;
 
 -- RLS (lecture publique)
 ALTER TABLE public.task_learning_stats ENABLE ROW LEVEL SECURITY;
-CREATE POLICY IF NOT EXISTS "Allow read for all" ON public.task_learning_stats FOR SELECT USING (true);
+DROP POLICY IF EXISTS "Allow read for all" ON public.task_learning_stats;
+CREATE POLICY "Allow read for all" ON public.task_learning_stats FOR SELECT USING (true);
