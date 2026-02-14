@@ -4,7 +4,7 @@ import re
 import logging
 from datetime import date
 from decimal import Decimal
-from typing import List, Literal, Optional
+from typing import List, Literal, Optional, Any
 
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
@@ -28,17 +28,11 @@ TVA_FR_RE = re.compile(r"^FR[0-9A-Z]{0,2}\d{9}$")
 
 
 def get_postgres_url() -> str | None:
-    """Construct PostgreSQL URL from Supabase credentials.
-
-    Returns:
-        PostgreSQL connection URL or None if credentials are missing.
-    """
-    # Try environment variable first
+    """Construct PostgreSQL URL from Supabase credentials."""
     database_url = os.getenv("DATABASE_URL")
     if database_url:
         return database_url
 
-    # Build from Supabase credentials
     db_host = os.getenv("SUPABASE_DB_HOST", "")
     db_port = os.getenv("SUPABASE_DB_PORT", "5432")
     db_name = os.getenv("SUPABASE_DB_NAME", "postgres")
@@ -48,20 +42,86 @@ def get_postgres_url() -> str | None:
         logger.warning("No database credentials configured - checkpoint persistence disabled")
         return None
 
-    # Format: postgresql://postgres:password@host:port/database
     return f"postgresql://postgres:{db_password}@{db_host}:{db_port}/{db_name}"
 
 
+# --- CONFIGURATION LLM ---
+
 DEFAULT_MODEL = os.getenv("LLM_MODEL", "gpt-4o-mini")
 FALLBACK_MODEL = os.getenv("LLM_FALLBACK_MODEL", "gpt-4o-mini")
-FAST_MODEL = os.getenv("LLM_FAST_MODEL", "gpt-4o-mini")  # Modèle rapide et économique
+FAST_MODEL = os.getenv("LLM_FAST_MODEL", "gpt-4o-mini")
 FAST_FALLBACK_MODEL = os.getenv("LLM_FAST_FALLBACK_MODEL", "gpt-3.5-turbo")
 
+
+# --- PROMPTS SYSTÈME ---
+
+# 1. PROMPT COURT (Pour le Reasoning Node / Router)
+# Utilisé pour la prise de décision technique et l'appel d'outils.
 SYSTEM_PROMPT = """
-Tu es un agent IA spécialisé dans le BTP. Tu analyses, prépares et valides des devis/factures en garantissant la conformité métier (TVA, pénalités, mentions obligatoires) et l'intégration Supabase.
-Respecte toujours le schéma JSON attendu et garde les réponses concises, actionnables et orientées correction.
+Tu es un agent IA spécialisé dans le BTP. Tu analyses, prépares et valides des devis/factures en garantissant la conformité métier.
+Respecte toujours le schéma JSON attendu.
 """.strip()
 
+# 2. PROMPT EXPERT (Pour le Synthesizer Node)
+# C'est ici que réside l'intelligence "métier" et le style de réponse.
+SYNTHESIZER_SYSTEM_PROMPT = """
+## 1. IDENTITÉ & MISSION
+Tu es NEXTMIND, l'assistant IA expert du BTP en France.
+Cible : Artisans et particuliers.
+Style : Direct, technique, "terrain", dense. Pas de formules de politesse excessives.
+Rôle : Aider à chiffrer, diagnostiquer, vérifier les normes (DTU) et préparer les chantiers.
+
+## 2. GESTION DU SAVOIR (RAG vs GÉNÉRAL)
+- **Priorité absolue au CONTEXTE RAG** (référentiel métier) s'il est fourni.
+- **Citation** : Si tu utilises une info du RAG (prix, technique), indique : "D'après le référentiel : [info]".
+- **Absence RAG** : Si l'info manque, utilise tes connaissances générales BTP France en précisant : "Estimation hors référentiel (moyenne marché)".
+- **Incertitude** : Ne jamais inventer. Si doute, propose une action : "À vérifier sur site par sondage".
+
+## 3. RÈGLES D'OR ANTI-HALLUCINATION
+1. **DTU/Normes** : Ne cite un numéro de DTU ou une loi que si tu es 100% sûr ou s'il est dans le RAG. Sinon, parle de "règles de l'art".
+2. **Prix** : Donne toujours une **fourchette** (Min - Max) + le **facteur de variation** (ex: accès, état du support).
+3. **Diagnostic** : N'affirme jamais la cause d'une panne à distance. Liste les causes probables par ordre de fréquence.
+
+## 4. INTELLIGENCE SITUATIONNELLE & REFORMULATION
+Avant de répondre, analyse l'intention.
+Si la demande est floue, reformule implicitement en tâches techniques :
+*Ex: "Refaire sdb" -> Dépose, plomberie/elec, étanchéité (SPEC/SELI), carrelage, appareillage.*
+
+**CAS SPÉCIAL : DIAGNOSTIC / PANNE**
+Si mots-clés : "problème", "fuite", "fissure", "panne", "bruit".
+ADOPTE IMMÉDIATEMENT CETTE STRUCTURE SPÉCIALE :
+1. **Sécurité/Urgence** : Y a-t-il un risque immédiat ? (Eau, Elec, Structure).
+2. **Checklist Points de Contrôle** : 4 à 6 points à vérifier (du plus simple au plus complexe).
+3. **Signaux d'Alerte** : Ce qui doit faire stopper les travaux.
+4. **Estimation** : Seulement après les vérifications.
+
+## 5. STRUCTURE DE RÉPONSE STANDARD (Hors Diagnostic)
+Pour les questions de conseils, devis ou techniques :
+
+1.  **Réponse Directe (La Synthèse)**
+    * 1 phrase avec la réponse clé (Prix, Délai ou Faisabilité).
+    * Utilise le **gras** pour les valeurs clés (ex: **45 - 60 €/m²**).
+
+2.  **Détail Technique & Mise en Œuvre**
+    * Étapes chronologiques logiques.
+    * Matériaux recommandés et temps de mise en œuvre (Cadence).
+    * Vocabulaire pro exigé : *Ragréage, primaire d'accrochage, calepinage, ébrasement, tableau, incorporation...*
+
+3.  **Points de Vigilance (Risk Management)**
+    * Lister 2-3 pièges classiques (ex: support bloqué, temps de séchage, compatibilité matériaux).
+    * Mentionner "Signal d'alerte" si applicable.
+
+4.  **Prochaine Action**
+    * Termine par une question utile ou une proposition concrète (Mini-devis, Checklist).
+
+## 6. FORMATAGE FINAL
+- Utilise des listes à puces pour la lisibilité.
+- Utilise le **gras** (`**valeur**`) UNIQUEMENT pour : Prix, Délais, Avertissements de sécurité.
+- Pas de phrases vides ("J'espère que cela vous aide"). Va droit au but.
+""".strip()
+
+
+# --- DATA MODELS ---
 
 def _norm_digits(value: str) -> str:
     return re.sub(r"\D", "", value or "")
@@ -101,22 +161,15 @@ class Party(BaseModel):
 
     @validator("siret")
     def valid_siret(cls, v):
-        if v:
-            return _norm_digits(v)
-        return v
+        return _norm_digits(v) if v else v
 
     @validator("siren")
     def valid_siren(cls, v):
-        if v:
-            return _norm_digits(v)
-        return v
+        return _norm_digits(v) if v else v
 
     @validator("tva_number")
     def valid_tva(cls, v):
-        if v:
-            normalized = v.replace(" ", "").upper()
-            return normalized
-        return v
+        return v.replace(" ", "").upper() if v else v
 
 
 class QuoteSchema(BaseModel):
@@ -138,12 +191,6 @@ class QuoteSchema(BaseModel):
             raise ValueError("Le devis doit contenir au moins une ligne")
         return v
 
-    def totals(self):
-        total_ht = sum(i.total_ht for i in self.line_items)
-        total_tva = sum(i.total_tva for i in self.line_items)
-        total_ttc = total_ht + total_tva
-        return {"total_ht": total_ht, "total_tva": total_tva, "total_ttc": total_ttc}
-
 
 class InvoiceSchema(QuoteSchema):
     doc_type: Literal["invoice"]
@@ -152,73 +199,72 @@ class InvoiceSchema(QuoteSchema):
     amount_paid: Optional[Decimal] = Decimal(0)
 
 
-class LLMWithRetry:
-    """Wrapper pour ajouter retry logic à un LLM."""
+# --- WRAPPER LLM ROBUSTE ---
 
+class LLMWithRetry:
+    """Wrapper pour ajouter retry logic à un LLM LangChain standard."""
+    
     def __init__(self, llm):
         self._llm = llm
 
-        if RETRY_AVAILABLE:
-            # Créer la méthode invoke avec retry
-            @retry(
-                stop=stop_after_attempt(3),
-                wait=wait_exponential(multiplier=1, min=2, max=10),
-                retry=retry_if_exception_type((RateLimitError, APIConnectionError, APITimeoutError, APIError)),
-                reraise=True
-            )
-            def invoke_with_retry(*args, **kwargs):
-                return self._llm.invoke(*args, **kwargs)
-
-            self._invoke_method = invoke_with_retry
-        else:
-            self._invoke_method = self._llm.invoke
-
     def invoke(self, *args, **kwargs):
-        """Invoke avec retry logic automatique."""
-        return self._invoke_method(*args, **kwargs)
+        if RETRY_AVAILABLE:
+            return self._invoke_with_retry(*args, **kwargs)
+        return self._llm.invoke(*args, **kwargs)
 
-    def __getattr__(self, name):
-        """Déléguer tous les autres attributs au LLM sous-jacent."""
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=2, max=10),
+        retry=retry_if_exception_type((RateLimitError, APIConnectionError, APITimeoutError, APIError)),
+        reraise=True
+    )
+    def _invoke_with_retry(self, *args, **kwargs):
+        """Méthode interne décorée par tenacity."""
+        return self._llm.invoke(*args, **kwargs)
+
+    def bind_tools(self, tools: list):
+        """Passe la méthode bind_tools au LLM sous-jacent."""
+        return self._llm.bind_tools(tools)
+    
+    def with_fallbacks(self, fallbacks: list):
+        """Permet de chainer les fallbacks."""
+        return LLMWithRetry(self._llm.with_fallbacks(fallbacks))
+
+    def __getattr__(self, name: str) -> Any:
+        """Délègue les autres attributs au LLM sous-jacent."""
         return getattr(self._llm, name)
 
 
 def get_llm(model: str | None = None, temperature: float = 0):
-    """Retourne le modèle principal avec fallback automatique et retry logic.
-
-    Retry automatique (3 tentatives avec exponential backoff) sur:
-    - RateLimitError (rate limit API)
-    - APIConnectionError (erreur réseau)
-    - APITimeoutError (timeout)
-    - APIError (erreur API générique)
-    """
+    """Retourne le modèle principal avec fallback automatique et retry logic."""
+    # Modèle principal
     primary = ChatOpenAI(model=model or DEFAULT_MODEL, temperature=temperature)
+    # Modèle de secours (souvent moins cher ou plus fiable sur la dispo)
     fallback = ChatOpenAI(model=FALLBACK_MODEL, temperature=temperature)
-    llm = primary.with_fallbacks([fallback])
-    return LLMWithRetry(llm)
+    
+    # On lie le fallback au principal
+    llm_with_fallback = primary.with_fallbacks([fallback])
+    
+    # On ajoute la couche de retry réseau
+    return LLMWithRetry(llm_with_fallback)
 
 
 def get_fast_llm(temperature: float = 0):
-    """Small/fast model for quick answers and routing (no extra context/tools).
-
-    Inclut retry logic automatique sur erreurs réseau/API.
-    """
+    """Modèle rapide pour le routing et les réponses courtes."""
     primary = ChatOpenAI(model=FAST_MODEL, temperature=temperature)
     fallback = ChatOpenAI(model=FAST_FALLBACK_MODEL, temperature=temperature)
-    llm = primary.with_fallbacks([fallback])
-    return LLMWithRetry(llm)
+    llm_with_fallback = primary.with_fallbacks([fallback])
+    return LLMWithRetry(llm_with_fallback)
 
 
 def get_embeddings():
     """Sélectionne OpenAI embeddings par défaut, Mistral si configuré."""
     try:
-        from langchain_mistralai import MistralAIEmbeddings  # type: ignore
-    except Exception:
-        MistralAIEmbeddings = None
-
-    mistral_key = os.getenv("MISTRAL_API_KEY")
-    if mistral_key and MistralAIEmbeddings is not None:
-        try:
+        from langchain_mistralai import MistralAIEmbeddings
+        mistral_key = os.getenv("MISTRAL_API_KEY")
+        if mistral_key:
             return MistralAIEmbeddings(model="mistral-embed")
-        except Exception:
-            pass
+    except (ImportError, Exception):
+        pass
+        
     return OpenAIEmbeddings()
