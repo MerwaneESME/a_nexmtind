@@ -3,7 +3,9 @@ import json
 import os
 import re
 import tempfile
+import time
 import unicodedata
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional
@@ -26,6 +28,94 @@ from .utils.pdf_generator import ChecklistPDFGenerator, extract_checklist_info_w
 
 # Cache par thread_id pour garder le dernier formulaire
 SESSION_PAYLOADS: dict[str, dict] = {}
+
+# Cache contexte projet (évite de refaire 8 appels Supabase par requête)
+_PROJECT_CONTEXT_CACHE: dict[str, tuple[float, dict]] = {}
+_PROJECT_CONTEXT_TTL = 45.0  # secondes
+
+
+def _get_project_context_cache(key: str) -> dict | None:
+    entry = _PROJECT_CONTEXT_CACHE.get(key)
+    if entry and (time.monotonic() - entry[0]) < _PROJECT_CONTEXT_TTL:
+        return entry[1]
+    return None
+
+
+def _set_project_context_cache(key: str, ctx: dict) -> None:
+    _PROJECT_CONTEXT_CACHE[key] = (time.monotonic(), ctx)
+
+
+# ── Fast-path project-chat ─────────────────────────────────────────────────
+_PROJECT_GREETING_RE = re.compile(
+    r"^\s*(bonjour|salut|hello|hey|bonsoir|coucou|bonne\s*(journée|nuit|soirée))\b[!?.,\s]*$",
+    re.IGNORECASE,
+)
+_PROJECT_THANKS_RE = re.compile(
+    r"^\s*(merci|thanks|super|parfait|top|c'?est\s+bon|ok|d'?accord|très\s+bien|bonne?\s+idée)\b[!?.,\s]*$",
+    re.IGNORECASE,
+)
+_PROJECT_DATA_KEYWORDS = re.compile(
+    r"\b(devis|planning|tâche|tache|budget|coût|cout|avancement|membre|message|projet|"
+    r"interven|phase|lot|document|facture|délai|delai|optimis|analys|conformité|marge|"
+    r"rentabilité|risque|prochaine?s?\s+étape|étape)\b",
+    re.IGNORECASE,
+)
+
+
+def _project_trivial_reply(message: str) -> str | None:
+    """Réponse instantanée pour messages ne nécessitant pas le contexte projet."""
+    msg = (message or "").strip()
+    if not msg:
+        return None
+    if _PROJECT_GREETING_RE.match(msg):
+        return "Bonjour ! Posez-moi vos questions sur votre projet : devis, planning, budget, avancement…"
+    if _PROJECT_THANKS_RE.match(msg):
+        return "Avec plaisir ! Avez-vous d'autres questions sur votre projet ?"
+    return None
+
+
+def _project_needs_context(message: str) -> bool:
+    """Retourne True si le message nécessite le contexte projet (Supabase)."""
+    return bool(_PROJECT_DATA_KEYWORDS.search(message or ""))
+
+
+def _project_quick_actions(query: str, is_client: bool) -> list[dict]:
+    """Génère des actions rapides contextuelles pour le chat projet."""
+    q = (query or "").lower()
+    actions: list[dict] = []
+
+    if any(k in q for k in ("coût", "cout", "budget", "prix", "marge", "optimis", "rentab")):
+        actions.append({"id": "analyze_costs", "label": "Analyser les marges", "prompt": "Analyse les marges et la rentabilité de chaque poste du devis.", "icon": "💰"})
+        if not is_client:
+            actions.append({"id": "optimize_costs", "label": "Optimiser les coûts", "prompt": "Quels postes peut-on réduire sans impacter la qualité ?", "icon": "✂️"})
+
+    if any(k in q for k in ("planning", "délai", "delai", "étape", "etape", "tâche", "tache", "calendrier")):
+        actions.append({"id": "propose_plan", "label": "Proposer un planning", "prompt": "Génère un planning détaillé pour ce projet.", "icon": "📅"})
+        actions.append({"id": "next_steps", "label": "Prochaines étapes", "prompt": "Quelles sont les prochaines étapes prioritaires du projet ?", "icon": "➡️"})
+
+    if any(k in q for k in ("devis", "conformité", "mention", "tva", "vérif", "verif")):
+        actions.append({"id": "check_compliance", "label": "Vérifier la conformité", "prompt": "Vérifie la conformité réglementaire du devis (TVA, mentions obligatoires, DTU).", "icon": "✅"})
+
+    if any(k in q for k in ("risque", "attention", "problème", "probleme", "danger")):
+        actions.append({"id": "identify_risks", "label": "Identifier les risques", "prompt": "Quels sont les risques principaux sur ce projet et comment les mitiger ?", "icon": "⚠️"})
+
+    # Fallback selon rôle
+    if not actions:
+        if is_client:
+            actions = [
+                {"id": "explain_devis", "label": "Expliquer le devis", "prompt": "Explique-moi les postes principaux du devis en termes simples.", "icon": "📄"},
+                {"id": "project_steps", "label": "Étapes du projet", "prompt": "Quelles sont les grandes étapes de mon projet ?", "icon": "📋"},
+                {"id": "budget_summary", "label": "Résumé du budget", "prompt": "Quel est le budget total et quels sont les postes les plus importants ?", "icon": "💶"},
+            ]
+        else:
+            actions = [
+                {"id": "analyze_devis", "label": "Analyser le devis", "prompt": "Analyse le devis : rentabilité, conformité et points d'amélioration.", "icon": "📊"},
+                {"id": "propose_plan", "label": "Proposer un planning", "prompt": "Génère un planning détaillé pour ce projet.", "icon": "📅"},
+                {"id": "next_steps", "label": "Prochaines étapes", "prompt": "Quelles sont les prochaines étapes prioritaires du projet ?", "icon": "➡️"},
+            ]
+
+    return actions[:3]
+
 
 ALLOWED_ORIGINS = os.getenv("AI_CORS_ALLOW_ORIGINS", "*")
 origins = [origin.strip() for origin in ALLOWED_ORIGINS.split(",") if origin.strip()]
@@ -545,6 +635,12 @@ def _apply_planning_guardrails(proposal: dict, now: datetime) -> dict:
     return proposal
 
 def _build_project_context(sb, project_id: str, user_id: str) -> dict:
+    cache_key = f"{project_id}:{user_id}"
+    cached = _get_project_context_cache(cache_key)
+    if cached is not None:
+        return cached
+
+    # Vérification d'accès (bloquante, nécessaire avant de continuer)
     membership = (
         sb.table("project_members")
         .select("id,role,status")
@@ -556,38 +652,73 @@ def _build_project_context(sb, project_id: str, user_id: str) -> dict:
     if not membership.data:
         return {"error": "not_allowed"}
 
-    project_rows = (
-        sb.table("projects")
-        .select("id,name,description,project_type,city,address,status,created_at,updated_at")
-        .eq("id", project_id)
-        .limit(1)
-        .execute()
-    ).data or []
-    project = project_rows[0] if project_rows else None
+    # Appels Supabase indépendants en parallèle
+    def _fetch_project():
+        rows = (
+            sb.table("projects")
+            .select("id,name,description,project_type,city,address,status,created_at,updated_at")
+            .eq("id", project_id)
+            .limit(1)
+            .execute()
+        ).data or []
+        return rows[0] if rows else None
 
-    participants = (
-        sb.table("project_members")
-        .select("user_id,role,status,invited_email,profiles:profiles!project_members_user_id_fkey(id,full_name,email,company_name)")
-        .eq("project_id", project_id)
-        .execute()
-    ).data or []
+    def _fetch_participants():
+        return (
+            sb.table("project_members")
+            .select("user_id,role,status,invited_email,profiles:profiles!project_members_user_id_fkey(id,full_name,email,company_name)")
+            .eq("project_id", project_id)
+            .execute()
+        ).data or []
 
-    messages = (
-        sb.table("project_messages")
-        .select("message,created_at,sender_id")
-        .eq("project_id", project_id)
-        .order("created_at", desc=True)
-        .limit(20)
-        .execute()
-    ).data or []
+    def _fetch_messages():
+        return (
+            sb.table("project_messages")
+            .select("message,created_at,sender_id")
+            .eq("project_id", project_id)
+            .order("created_at", desc=True)
+            .limit(20)
+            .execute()
+        ).data or []
 
-    tasks = (
-        sb.table("project_tasks")
-        .select("name,status,start_date,end_date,description,completed_at")
-        .eq("project_id", project_id)
-        .execute()
-    ).data or []
+    def _fetch_tasks():
+        return (
+            sb.table("project_tasks")
+            .select("name,status,start_date,end_date,description,completed_at")
+            .eq("project_id", project_id)
+            .execute()
+        ).data or []
 
+    def _fetch_devis():
+        return (
+            sb.table("devis")
+            .select("id,status,total,metadata,created_at")
+            .eq("project_id", project_id)
+            .order("created_at", desc=True)
+            .execute()
+        ).data or []
+
+    results: dict[str, Any] = {}
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        futures = {
+            pool.submit(_fetch_project): "project",
+            pool.submit(_fetch_participants): "participants",
+            pool.submit(_fetch_messages): "messages",
+            pool.submit(_fetch_tasks): "tasks",
+            pool.submit(_fetch_devis): "devis",
+        }
+        for future in as_completed(futures):
+            key = futures[future]
+            try:
+                results[key] = future.result()
+            except Exception:
+                results[key] = [] if key != "project" else None
+
+    project = results.get("project")
+    messages = results.get("messages") or []
+    devis = results.get("devis") or []
+
+    # learning_stats dépend de project_type → après le fetch parallèle
     learning_stats = []
     try:
         trade = project.get("project_type") if project else None
@@ -596,39 +727,36 @@ def _build_project_context(sb, project_id: str, user_id: str) -> dict:
         )
         if trade:
             stats_query = stats_query.eq("trade", trade)
-        stats_query = stats_query.order("sample_count", desc=True).limit(6)
-        learning_stats = stats_query.execute().data or []
+        learning_stats = stats_query.order("sample_count", desc=True).limit(6).execute().data or []
     except Exception:
         learning_stats = []
 
-    devis = (
-        sb.table("devis")
-        .select("id,status,total,metadata,created_at")
-        .eq("project_id", project_id)
-        .order("created_at", desc=True)
-        .execute()
-    ).data or []
-
+    # devis_items dépend des IDs devis → après le fetch parallèle
     devis_items = []
     if devis:
         devis_ids = [item["id"] for item in devis if item.get("id")]
         if devis_ids:
-            devis_items = (
-                sb.table("devis_items")
-                .select("devis_id,description,qty,unit_price,total")
-                .in_("devis_id", devis_ids)
-                .execute()
-            ).data or []
+            try:
+                devis_items = (
+                    sb.table("devis_items")
+                    .select("devis_id,description,qty,unit_price,total")
+                    .in_("devis_id", devis_ids)
+                    .execute()
+                ).data or []
+            except Exception:
+                devis_items = []
 
-    return {
+    ctx = {
         "project": project,
-        "participants": participants,
+        "participants": results.get("participants") or [],
         "messages": list(reversed(messages)),
-        "tasks": tasks,
+        "tasks": results.get("tasks") or [],
         "learning_stats": learning_stats,
         "devis": devis,
         "devis_items": devis_items,
     }
+    _set_project_context_cache(cache_key, ctx)
+    return ctx
 
 
 class PrepareItem(BaseModel):
@@ -829,6 +957,18 @@ async def chat_legacy(payload: ChatInput):
 @app.post("/project-chat")
 async def project_chat(payload: ProjectChatInput):
     """Chat IA par projet avec proposition de planning."""
+    is_client = (payload.user_role or "").lower() in {"particulier", "client"}
+
+    # ── Fast-path : pas besoin du contexte projet ──────────────────────────
+    trivial = _project_trivial_reply(payload.message)
+    if trivial:
+        return JSONResponse({
+            "reply": trivial,
+            "proposal": None,
+            "requires_devis": False,
+            "quick_actions": _project_quick_actions("", is_client),
+        })
+
     sb = get_client()
     if not sb:
         return JSONResponse({"reply": "Connexion Supabase indisponible.", "proposal": None, "requires_devis": True})
@@ -845,8 +985,6 @@ async def project_chat(payload: ProjectChatInput):
     now_label = now.strftime("%Y-%m-%d %H:%M")
     tz_label = now.tzname() or "local"
 
-    is_client = (payload.user_role or "").lower() in {"particulier", "client"}
-    
     persona = (
         "Tu es un conseiller BTP bienveillant pour un particulier. "
         "Ton role est de l'aider a comprendre son projet, le devis, les etapes, et les termes techniques. "
@@ -941,7 +1079,7 @@ Message utilisateur:
 force_plan: {bool(payload.force_plan)}
 """
 
-    llm = get_llm()
+    llm = get_fast_llm()
     result = llm.invoke([
         SystemMessage(content=system_prompt),
         HumanMessage(content=user_block),
@@ -974,6 +1112,7 @@ force_plan: {bool(payload.force_plan)}
         reply_text = _build_devis_terms_ui_reply(payload.message)
 
     parsed["reply"] = reply_text
+    parsed["quick_actions"] = _project_quick_actions(payload.message, is_client)
 
     return JSONResponse(parsed)
 
