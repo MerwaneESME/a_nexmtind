@@ -3,6 +3,7 @@ __pycache__/
 *.py[cod]
 .env
 .env.*
+!.env.example
 .DS_Store
 .vscode/
 .idea/
@@ -12,4 +13,5 @@ __pycache__/
 /supabase/.branches
 /supabase/.temp
 logs/
+output/
 

@@ -1,15 +1,18 @@
 ﻿"""API FastAPI V2 - Gestion correcte des donnÃ©es structurÃ©es."""
+import json
 import os
 import re
 import tempfile
+import time
 import unicodedata
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional
 
-from fastapi import FastAPI, UploadFile
+from fastapi import FastAPI, File, Form, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from langchain_core.messages import HumanMessage, SystemMessage
 from pydantic import BaseModel, Field, validator
@@ -21,9 +24,146 @@ from .config import get_fast_llm, get_llm
 from .supabase_client import get_client, upsert_document
 from .tools import calculate_totals_tool, clean_lines_tool, supabase_lookup_tool, validate_devis_tool
 from .logging_config import logger
+from .utils.pdf_generator import ChecklistPDFGenerator, extract_checklist_info_with_llm
 
 # Cache par thread_id pour garder le dernier formulaire
 SESSION_PAYLOADS: dict[str, dict] = {}
+
+# Cache contexte projet (évite de refaire 8 appels Supabase par requête)
+_PROJECT_CONTEXT_CACHE: dict[str, tuple[float, dict]] = {}
+_PROJECT_CONTEXT_TTL = 45.0  # secondes
+
+
+_EURO_AMOUNT_RE = re.compile(
+    r"(?P<num>(?:\d{1,3}(?:[ \u202f.,]\d{3})+|\d+)(?:[.,]\d+)?)\s*(?:EUR|€)\b",
+    re.IGNORECASE,
+)
+
+
+def format_eur(value: int | float) -> str:
+    """Formate un montant en euros au format français (ex: 1 234,00 €)."""
+    amount = float(value)
+    raw = f"{amount:,.2f}"  # ex: 1,234.56
+    raw = raw.replace(",", "X").replace(".", ",").replace("X", "\u202f")
+    return f"{raw}\u00a0€"
+
+
+def normalize_eur_in_text(text: str) -> str:
+    """Normalise les montants 'XXX EUR' ou 'XXX€' en format français 'XXX,00 €'."""
+
+    def _parse_num(num: str) -> float | None:
+        cleaned = (num or "").replace("\u202f", "").replace(" ", "")
+        if not cleaned:
+            return None
+
+        has_comma = "," in cleaned
+        has_dot = "." in cleaned
+        if has_comma and has_dot:
+            dec_is_comma = cleaned.rfind(",") > cleaned.rfind(".")
+            if dec_is_comma:
+                cleaned = cleaned.replace(".", "").replace(",", ".")
+            else:
+                cleaned = cleaned.replace(",", "")
+        elif has_comma and not has_dot:
+            cleaned = cleaned.replace(",", ".")
+
+        try:
+            return float(cleaned)
+        except Exception:
+            return None
+
+    def _repl(match: re.Match[str]) -> str:
+        raw_num = match.group("num")
+        parsed = _parse_num(raw_num)
+        if parsed is None:
+            return match.group(0)
+        return format_eur(parsed)
+
+    return _EURO_AMOUNT_RE.sub(_repl, text or "")
+
+
+def _get_project_context_cache(key: str) -> dict | None:
+    entry = _PROJECT_CONTEXT_CACHE.get(key)
+    if entry and (time.monotonic() - entry[0]) < _PROJECT_CONTEXT_TTL:
+        return entry[1]
+    return None
+
+
+def _set_project_context_cache(key: str, ctx: dict) -> None:
+    _PROJECT_CONTEXT_CACHE[key] = (time.monotonic(), ctx)
+
+
+# ── Fast-path project-chat ─────────────────────────────────────────────────
+_PROJECT_GREETING_RE = re.compile(
+    r"^\s*(bonjour|salut|hello|hey|bonsoir|coucou|bonne\s*(journée|nuit|soirée))\b[!?.,\s]*$",
+    re.IGNORECASE,
+)
+_PROJECT_THANKS_RE = re.compile(
+    r"^\s*(merci|thanks|super|parfait|top|c'?est\s+bon|ok|d'?accord|très\s+bien|bonne?\s+idée)\b[!?.,\s]*$",
+    re.IGNORECASE,
+)
+_PROJECT_DATA_KEYWORDS = re.compile(
+    r"\b(devis|planning|tâche|tache|budget|coût|cout|avancement|membre|message|projet|"
+    r"interven|phase|lot|document|facture|délai|delai|optimis|analys|conformité|marge|"
+    r"rentabilité|risque|prochaine?s?\s+étape|étape)\b",
+    re.IGNORECASE,
+)
+
+
+def _project_trivial_reply(message: str) -> str | None:
+    """Réponse instantanée pour messages ne nécessitant pas le contexte projet."""
+    msg = (message or "").strip()
+    if not msg:
+        return None
+    if _PROJECT_GREETING_RE.match(msg):
+        return "Bonjour ! Posez-moi vos questions sur votre projet : devis, planning, budget, avancement…"
+    if _PROJECT_THANKS_RE.match(msg):
+        return "Avec plaisir ! Avez-vous d'autres questions sur votre projet ?"
+    return None
+
+
+def _project_needs_context(message: str) -> bool:
+    """Retourne True si le message nécessite le contexte projet (Supabase)."""
+    return bool(_PROJECT_DATA_KEYWORDS.search(message or ""))
+
+
+def _project_quick_actions(query: str, is_client: bool) -> list[dict]:
+    """Génère des actions rapides contextuelles pour le chat projet."""
+    q = (query or "").lower()
+    actions: list[dict] = []
+
+    if any(k in q for k in ("coût", "cout", "budget", "prix", "marge", "optimis", "rentab")):
+        actions.append({"id": "analyze_costs", "label": "Analyser les marges", "prompt": "Analyse les marges et la rentabilité de chaque poste du devis.", "icon": "💰"})
+        if not is_client:
+            actions.append({"id": "optimize_costs", "label": "Optimiser les coûts", "prompt": "Quels postes peut-on réduire sans impacter la qualité ?", "icon": "✂️"})
+
+    if any(k in q for k in ("planning", "délai", "delai", "étape", "etape", "tâche", "tache", "calendrier")):
+        actions.append({"id": "propose_plan", "label": "Proposer un planning", "prompt": "Génère un planning détaillé pour ce projet.", "icon": "📅"})
+        actions.append({"id": "next_steps", "label": "Prochaines étapes", "prompt": "Quelles sont les prochaines étapes prioritaires du projet ?", "icon": "➡️"})
+
+    if any(k in q for k in ("devis", "conformité", "mention", "tva", "vérif", "verif")):
+        actions.append({"id": "check_compliance", "label": "Vérifier la conformité", "prompt": "Vérifie la conformité réglementaire du devis (TVA, mentions obligatoires, DTU).", "icon": "✅"})
+
+    if any(k in q for k in ("risque", "attention", "problème", "probleme", "danger")):
+        actions.append({"id": "identify_risks", "label": "Identifier les risques", "prompt": "Quels sont les risques principaux sur ce projet et comment les mitiger ?", "icon": "⚠️"})
+
+    # Fallback selon rôle
+    if not actions:
+        if is_client:
+            actions = [
+                {"id": "explain_devis", "label": "Expliquer le devis", "prompt": "Explique-moi les postes principaux du devis en termes simples.", "icon": "📄"},
+                {"id": "project_steps", "label": "Étapes du projet", "prompt": "Quelles sont les grandes étapes de mon projet ?", "icon": "📋"},
+                {"id": "budget_summary", "label": "Résumé du budget", "prompt": "Quel est le budget total et quels sont les postes les plus importants ?", "icon": "💶"},
+            ]
+        else:
+            actions = [
+                {"id": "analyze_devis", "label": "Analyser le devis", "prompt": "Analyse le devis : rentabilité, conformité et points d'amélioration.", "icon": "📊"},
+                {"id": "propose_plan", "label": "Proposer un planning", "prompt": "Génère un planning détaillé pour ce projet.", "icon": "📅"},
+                {"id": "next_steps", "label": "Prochaines étapes", "prompt": "Quelles sont les prochaines étapes prioritaires du projet ?", "icon": "➡️"},
+            ]
+
+    return actions[:3]
+
 
 ALLOWED_ORIGINS = os.getenv("AI_CORS_ALLOW_ORIGINS", "*")
 origins = [origin.strip() for origin in ALLOWED_ORIGINS.split(",") if origin.strip()]
@@ -54,6 +194,114 @@ def save_upload(file: UploadFile) -> str:
     with os.fdopen(fd, "wb") as fh:
         fh.write(file.file.read())
     return path
+
+
+def _extract_file_text(file: UploadFile) -> tuple[str, str]:
+    """Extrait le texte d'un fichier uploadé (PDF, DOCX, PNG, JPG).
+    Retourne (texte_extrait, nom_fichier).
+    """
+    filename = file.filename or "fichier"
+    suffix = Path(filename).suffix.lower()
+    path = save_upload(file)
+    text = ""
+    try:
+        if suffix == ".pdf":
+            import pypdf
+            reader = pypdf.PdfReader(path)
+            text = "\n".join(page.extract_text() or "" for page in reader.pages)
+        elif suffix == ".docx":
+            import docx
+            document = docx.Document(path)
+            text = "\n".join(p.text for p in document.paragraphs)
+        elif suffix in (".png", ".jpg", ".jpeg"):
+            try:
+                import pytesseract
+                from PIL import Image
+                image = Image.open(path)
+                text = pytesseract.image_to_string(image)
+            except ImportError:
+                text = "[OCR non disponible pour les images]"
+        elif suffix in (".txt", ".md", ".csv"):
+            with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                text = fh.read()
+        else:
+            text = f"[Format non supporté : {suffix}]"
+    except Exception as exc:
+        logger.warning("_extract_file_text error: %s", exc)
+        text = f"[Erreur lors de la lecture du fichier : {exc}]"
+    finally:
+        try:
+            os.unlink(path)
+        except Exception:
+            pass
+    return text, filename
+
+
+def _download_devis_pdf_text(sb, devis_row: dict) -> str | None:
+    """Télécharge et extrait le texte du PDF d'un devis stocké dans Supabase Storage.
+    Retourne None si aucun PDF ou si l'extraction échoue.
+    """
+    metadata = devis_row.get("metadata") or {}
+    if not isinstance(metadata, dict):
+        return None
+
+    bucket = metadata.get("pdf_bucket")
+    path = metadata.get("pdf_path")
+    pdf_url = metadata.get("pdf_url")
+
+    pdf_bytes: bytes | None = None
+
+    # 1. Supabase Storage (prioritaire)
+    if bucket and path:
+        try:
+            pdf_bytes = sb.storage.from_(bucket).download(path)
+        except Exception as exc:
+            logger.warning("_download_devis_pdf_text: storage download failed: %s", exc)
+
+    # 2. URL publique en fallback
+    if not pdf_bytes and pdf_url:
+        try:
+            import urllib.request
+            req = urllib.request.Request(pdf_url, headers={"User-Agent": "NextMind/1.0"})
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                pdf_bytes = resp.read()
+        except Exception as exc:
+            logger.warning("_download_devis_pdf_text: URL download failed: %s", exc)
+
+    if not pdf_bytes:
+        return None
+
+    try:
+        import io
+        import pypdf
+        reader = pypdf.PdfReader(io.BytesIO(pdf_bytes))
+        text = "\n".join(page.extract_text() or "" for page in reader.pages)
+        return text.strip()[:6000] if text.strip() else None
+    except Exception as exc:
+        logger.warning("_download_devis_pdf_text: pdf extract failed: %s", exc)
+        return None
+
+
+def _extract_total_from_pdf_text(text: str) -> float | None:
+    """Tente d'extraire le montant total d'un PDF (recherche Total TTC / HT)."""
+    if not text:
+        return None
+    # Patterns: "Total TTC : 12 345,67 €" ou "TOTAL 12345.67" etc.
+    patterns = [
+        r"[Tt]otal\s+[Tt][Tt][Cc]\s*[:\s]+(\d[\d\s]*[.,]\d{2})",
+        r"[Tt]otal\s+[Hh][Tt]\s*[:\s]+(\d[\d\s]*[.,]\d{2})",
+        r"TOTAL\s*[:\s]+(\d[\d\s]*[.,]\d{2})",
+        r"[Mm]ontant\s+[Tt][Tt][Cc]\s*[:\s]+(\d[\d\s]*[.,]\d{2})",
+    ]
+    for pat in patterns:
+        match = re.search(pat, text)
+        if match:
+            raw = match.group(1).replace(" ", "").replace(",", ".")
+            try:
+                return float(raw)
+            except Exception:
+                continue
+    return None
 
 
 def _structured_from_metadata(metadata: Dict[str, Any] | None) -> dict | None:
@@ -206,6 +454,61 @@ def _pro_fast_reply(message: str) -> str | None:
         return None
 
 
+# ==================== Devis terms UI (front-end cards) ====================
+
+_DEVIS_TERMS_HINT_RE = re.compile(
+    r"\b(termes?|mots?|jargon|lexique|glossaire|clarif|expliq|défin|defin|décortiq|decortiq|comprendr)\b",
+    re.IGNORECASE,
+)
+_DEVIS_CONTEXT_RE = re.compile(r"\b(devis|facture)\b", re.IGNORECASE)
+_TERM_DEFINITION_RE = re.compile(
+    r"\b(c['’]est quoi|ça veut dire|ca veut dire|qu['’]est-ce que|definition|définition)\b",
+    re.IGNORECASE,
+)
+_BTP_TERMS_LIKELY_RE = re.compile(
+    r"\b(acompte|tva|décennale|decennale|rc\s*pro|dommages?-ouvrage|ipn|poutre|ragréage|ragreage|chape|étanchéité|etancheite|consuel|plomberie|gros\s*œuvre|gros\s*oeuvre|démolition|demolition)\b",
+    re.IGNORECASE,
+)
+
+
+def _should_show_devis_terms_ui(message: str) -> bool:
+    msg = (message or "").strip()
+    if not msg:
+        return False
+
+    msg_lower = msg.lower()
+
+    if _DEVIS_CONTEXT_RE.search(msg) and _DEVIS_TERMS_HINT_RE.search(msg):
+        return True
+
+    if _TERM_DEFINITION_RE.search(msg) and _BTP_TERMS_LIKELY_RE.search(msg):
+        return True
+
+    if "devis" in msg_lower and ("explique" in msg_lower or "clarifie" in msg_lower):
+        return True
+
+    return False
+
+
+def _build_devis_terms_ui_reply(message: str) -> str:
+    payload_query = (message or "").strip()
+    lowered = payload_query.lower()
+    if any(k in lowered for k in ("termes", "mots", "jargon", "lexique", "glossaire")):
+        payload_query = ""
+
+    payload = {"query": payload_query}
+    payload_json = json.dumps(payload, ensure_ascii=False)
+
+    return (
+        "Je vous aide à comprendre les termes techniques qu’on voit souvent sur un devis BTP.\n\n"
+        "```devis-terms\n"
+        f"{payload_json}\n"
+        "```\n\n"
+        "Si vous avez votre devis sous les yeux, copiez/collez une ligne (ou joignez le PDF) "
+        "et je vous l’explique ligne par ligne."
+    )
+
+
 # ==================== ModÃ¨les Pydantic ====================
 
 class ChatHistoryItem(BaseModel):
@@ -228,6 +531,8 @@ class ProjectChatInput(BaseModel):
     history: Optional[List[ChatHistoryItem]] = None
     force_plan: Optional[bool] = None
     user_role: Optional[str] = None
+    file_context: Optional[str] = None   # contenu extrait d'un fichier joint
+    file_name: Optional[str] = None      # nom du fichier joint
 
 
 class ProSearchInput(BaseModel):
@@ -372,68 +677,114 @@ def _format_devis_title(metadata: dict | None) -> str | None:
 def _format_project_context(context: dict) -> str:
     project = context.get("project") or {}
     participants = context.get("participants") or []
+    messages = context.get("messages") or []
     tasks = context.get("tasks") or []
     learning_stats = context.get("learning_stats") or []
     devis = context.get("devis") or []
     devis_items = context.get("devis_items") or []
+    devis_pdf_texts = context.get("devis_pdf_texts") or []
 
     lines: list[str] = []
+
+    # ── Projet ────────────────────────────────────────────────────────────
     if project:
-        lines.append(f"Projet: {project.get('name') or 'Sans titre'}")
+        lines.append("=== PROJET ===")
+        lines.append(f"Nom: {project.get('name') or 'Sans titre'}")
         if project.get("project_type"):
-            lines.append(f"Type: {project.get('project_type')}")
+            lines.append(f"Type de travaux: {project.get('project_type')}")
         address = project.get("address")
         city = project.get("city")
         if address or city:
-            lines.append(f"Lieu: {address or ''} {city or ''}".strip())
+            lines.append(f"Lieu: {(address or '')} {(city or '')}".strip())
         if project.get("status"):
             lines.append(f"Statut: {project.get('status')}")
+        if project.get("description"):
+            lines.append(f"Description: {project.get('description')}")
 
+    # ── Équipe ────────────────────────────────────────────────────────────
     if participants:
-        lines.append("Participants:")
-        for participant in participants[:5]:
-            profile = participant.get("profiles") or {}
-            name = profile.get("full_name") or profile.get("company_name") or participant.get("invited_email")
-            role = participant.get("role") or "membre"
-            if name:
-                lines.append(f"- {name} ({role})")
+        lines.append("\n=== EQUIPE ===")
+        for p in participants[:6]:
+            profile = p.get("profiles") or {}
+            name = profile.get("full_name") or profile.get("company_name") or p.get("invited_email") or "Inconnu"
+            role = p.get("role") or "membre"
+            status = p.get("status") or ""
+            lines.append(f"- {name} | {role} | {status}")
 
+    # ── Tâches ────────────────────────────────────────────────────────────
     if tasks:
-        lines.append("Taches en cours:")
-        for task in tasks[:6]:
-            time_range = _extract_time_range(task.get("description"))
-            period = task.get("start_date") or ""
-            if task.get("end_date") and task.get("end_date") != task.get("start_date"):
-                period = f"{task.get('start_date')} -> {task.get('end_date')}"
+        lines.append("\n=== TACHES ===")
+        for task in tasks[:10]:
             label = task.get("name") or "Tache"
-            status = task.get("status") or ""
-            time_part = f" ({time_range})" if time_range else ""
-            lines.append(f"- {label} | {status} | {period}{time_part}".strip())
+            status = task.get("status") or "en cours"
+            period = ""
+            if task.get("start_date") and task.get("end_date"):
+                period = f" | du {task['start_date']} au {task['end_date']}"
+            elif task.get("start_date"):
+                period = f" | a partir du {task['start_date']}"
+            time_range = _extract_time_range(task.get("description"))
+            time_part = f" | horaires: {time_range}" if time_range else ""
+            lines.append(f"- {label} | {status}{period}{time_part}")
 
+    # ── Devis avec détail financier complet ───────────────────────────────
     if devis:
-        lines.append("Devis:")
-        for item in devis[:3]:
-            title = _format_devis_title(item.get("metadata")) or "Devis"
-            status = item.get("status") or "brouillon"
-            total = item.get("total")
-            total_label = f"{total} EUR" if total is not None else "montant n/a"
-            lines.append(f"- {title} | {status} | {total_label}")
+        lines.append("\n=== DEVIS ===")
+        items_by_devis: dict[str, list] = {}
+        for di in devis_items:
+            did = di.get("devis_id") or ""
+            items_by_devis.setdefault(did, []).append(di)
 
-    if devis_items:
-        lines.append("Postes principaux:")
-        for item in devis_items[:8]:
-            description = item.get("description")
-            if description:
-                lines.append(f"- {description}")
+        # Index PDF texts by devis_id
+        pdf_by_devis = {p["devis_id"]: p for p in devis_pdf_texts}
 
+        for d in devis[:3]:
+            title = _format_devis_title(d.get("metadata")) or "Devis"
+            status = d.get("status") or "brouillon"
+            total = d.get("total")
+            total_label = format_eur(total) if isinstance(total, (int, float)) else "montant n/a"
+            lines.append(f"\nDevis: {title} | Statut: {status} | Total: {total_label}")
+
+            did = d.get("id") or ""
+            postes = items_by_devis.get(did) or []
+            if postes:
+                lines.append("  Postes (description | qte | prix unitaire HT | total HT):")
+                for poste in postes[:20]:
+                    desc = poste.get("description") or "Poste"
+                    qty = poste.get("qty")
+                    unit_price = poste.get("unit_price")
+                    total_poste = poste.get("total")
+                    qty_label = f"qte {qty}" if qty is not None else ""
+                    price_label = f"PU {format_eur(unit_price)}" if isinstance(unit_price, (int, float)) else ""
+                    total_p_label = f"total {format_eur(total_poste)} HT" if isinstance(total_poste, (int, float)) else ""
+                    detail = " | ".join(p for p in [qty_label, price_label, total_p_label] if p)
+                    lines.append(f"  - {desc}" + (f" ({detail})" if detail else ""))
+            elif did in pdf_by_devis:
+                # Aucun poste en DB mais texte PDF extrait : l'inclure pour que l'IA puisse l'analyser
+                pdf_entry = pdf_by_devis[did]
+                pdf_total = pdf_entry.get("total")
+                if isinstance(pdf_total, (int, float)):
+                    lines.append(f"  Total extrait du PDF: {format_eur(pdf_total)}")
+                lines.append(f"  Contenu du PDF (brut, max 4000 car.):")
+                lines.append(pdf_entry["text"][:4000])
+
+    # ── Messages récents du projet ─────────────────────────────────────────
+    if messages:
+        lines.append("\n=== MESSAGES RECENTS DU PROJET ===")
+        for msg in messages[-6:]:
+            content = (msg.get("message") or "").strip()
+            date_str = (msg.get("created_at") or "")[:10]
+            if content:
+                lines.append(f"[{date_str}] {content[:300]}")
+
+    # ── Références durées BTP ─────────────────────────────────────────────
     if learning_stats:
-        lines.append("Templates appris:")
+        lines.append("\n=== REFERENCES DUREES BTP (projets similaires) ===")
         for item in learning_stats[:6]:
             name = item.get("example_name") or item.get("normalized_label") or "Tache"
             duration = item.get("avg_duration_hours")
             count = item.get("sample_count") or 0
             duration_label = f"{duration:.1f}h" if isinstance(duration, (int, float)) else "duree n/a"
-            lines.append(f"- {name} | moyenne {duration_label} | {count} exemples")
+            lines.append(f"- {name} : {duration_label} en moyenne ({count} projets similaires)")
 
     return "\n".join(lines)
 
@@ -488,6 +839,12 @@ def _apply_planning_guardrails(proposal: dict, now: datetime) -> dict:
     return proposal
 
 def _build_project_context(sb, project_id: str, user_id: str) -> dict:
+    cache_key = f"{project_id}:{user_id}"
+    cached = _get_project_context_cache(cache_key)
+    if cached is not None:
+        return cached
+
+    # Vérification d'accès (bloquante, nécessaire avant de continuer)
     membership = (
         sb.table("project_members")
         .select("id,role,status")
@@ -499,38 +856,73 @@ def _build_project_context(sb, project_id: str, user_id: str) -> dict:
     if not membership.data:
         return {"error": "not_allowed"}
 
-    project_rows = (
-        sb.table("projects")
-        .select("id,name,description,project_type,city,address,status,created_at,updated_at")
-        .eq("id", project_id)
-        .limit(1)
-        .execute()
-    ).data or []
-    project = project_rows[0] if project_rows else None
+    # Appels Supabase indépendants en parallèle
+    def _fetch_project():
+        rows = (
+            sb.table("projects")
+            .select("id,name,description,project_type,city,address,status,created_at,updated_at")
+            .eq("id", project_id)
+            .limit(1)
+            .execute()
+        ).data or []
+        return rows[0] if rows else None
 
-    participants = (
-        sb.table("project_members")
-        .select("user_id,role,status,invited_email,profiles:profiles!project_members_user_id_fkey(id,full_name,email,company_name)")
-        .eq("project_id", project_id)
-        .execute()
-    ).data or []
+    def _fetch_participants():
+        return (
+            sb.table("project_members")
+            .select("user_id,role,status,invited_email,profiles:profiles!project_members_user_id_fkey(id,full_name,email,company_name)")
+            .eq("project_id", project_id)
+            .execute()
+        ).data or []
 
-    messages = (
-        sb.table("project_messages")
-        .select("message,created_at,sender_id")
-        .eq("project_id", project_id)
-        .order("created_at", desc=True)
-        .limit(20)
-        .execute()
-    ).data or []
+    def _fetch_messages():
+        return (
+            sb.table("project_messages")
+            .select("message,created_at,sender_id")
+            .eq("project_id", project_id)
+            .order("created_at", desc=True)
+            .limit(20)
+            .execute()
+        ).data or []
 
-    tasks = (
-        sb.table("project_tasks")
-        .select("name,status,start_date,end_date,description,completed_at")
-        .eq("project_id", project_id)
-        .execute()
-    ).data or []
+    def _fetch_tasks():
+        return (
+            sb.table("project_tasks")
+            .select("name,status,start_date,end_date,description,completed_at")
+            .eq("project_id", project_id)
+            .execute()
+        ).data or []
 
+    def _fetch_devis():
+        return (
+            sb.table("devis")
+            .select("id,status,total,metadata,created_at")
+            .eq("project_id", project_id)
+            .order("created_at", desc=True)
+            .execute()
+        ).data or []
+
+    results: dict[str, Any] = {}
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        futures = {
+            pool.submit(_fetch_project): "project",
+            pool.submit(_fetch_participants): "participants",
+            pool.submit(_fetch_messages): "messages",
+            pool.submit(_fetch_tasks): "tasks",
+            pool.submit(_fetch_devis): "devis",
+        }
+        for future in as_completed(futures):
+            key = futures[future]
+            try:
+                results[key] = future.result()
+            except Exception:
+                results[key] = [] if key != "project" else None
+
+    project = results.get("project")
+    messages = results.get("messages") or []
+    devis = results.get("devis") or []
+
+    # learning_stats dépend de project_type → après le fetch parallèle
     learning_stats = []
     try:
         trade = project.get("project_type") if project else None
@@ -539,39 +931,71 @@ def _build_project_context(sb, project_id: str, user_id: str) -> dict:
         )
         if trade:
             stats_query = stats_query.eq("trade", trade)
-        stats_query = stats_query.order("sample_count", desc=True).limit(6)
-        learning_stats = stats_query.execute().data or []
+        learning_stats = stats_query.order("sample_count", desc=True).limit(6).execute().data or []
     except Exception:
         learning_stats = []
 
-    devis = (
-        sb.table("devis")
-        .select("id,status,total,metadata,created_at")
-        .eq("project_id", project_id)
-        .order("created_at", desc=True)
-        .execute()
-    ).data or []
-
+    # devis_items dépend des IDs devis → après le fetch parallèle
     devis_items = []
     if devis:
         devis_ids = [item["id"] for item in devis if item.get("id")]
         if devis_ids:
-            devis_items = (
-                sb.table("devis_items")
-                .select("devis_id,description,qty,unit_price,total")
-                .in_("devis_id", devis_ids)
-                .execute()
-            ).data or []
+            try:
+                devis_items = (
+                    sb.table("devis_items")
+                    .select("devis_id,description,qty,unit_price,total")
+                    .in_("devis_id", devis_ids)
+                    .execute()
+                ).data or []
+            except Exception:
+                devis_items = []
 
-    return {
+    # Pour les devis sans postes (PDF uploadé sans extraction), tenter d'extraire le texte du PDF
+    devis_pdf_texts: list[dict] = []
+    if devis:
+        devis_with_items = {item["devis_id"] for item in devis_items if item.get("devis_id")}
+        for dv in devis:
+            dv_id = dv.get("id") or ""
+            if dv_id and dv_id not in devis_with_items:
+                meta = dv.get("metadata") or {}
+                if not isinstance(meta, dict):
+                    continue
+                # Seulement si le devis a un PDF en storage
+                if meta.get("pdf_bucket") or meta.get("pdf_url"):
+                    pdf_text = _download_devis_pdf_text(sb, dv)
+                    if pdf_text:
+                        title = _format_devis_title(meta) or "Devis"
+                        total = dv.get("total")
+                        # Si le total DB est null, essayer de l'extraire du PDF
+                        if total is None:
+                            extracted_total = _extract_total_from_pdf_text(pdf_text)
+                            if extracted_total is not None:
+                                total = extracted_total
+                                try:
+                                    sb.table("devis").update({"total": extracted_total}).eq("id", dv_id).execute()
+                                    dv["total"] = extracted_total  # mise à jour locale
+                                except Exception:
+                                    pass
+                        devis_pdf_texts.append({
+                            "devis_id": dv_id,
+                            "title": title,
+                            "text": pdf_text,
+                            "total": total,
+                        })
+                        logger.info("📄 devis PDF extracted: %s (%d chars)", title, len(pdf_text))
+
+    ctx = {
         "project": project,
-        "participants": participants,
+        "participants": results.get("participants") or [],
         "messages": list(reversed(messages)),
-        "tasks": tasks,
+        "tasks": results.get("tasks") or [],
         "learning_stats": learning_stats,
         "devis": devis,
         "devis_items": devis_items,
+        "devis_pdf_texts": devis_pdf_texts,
     }
+    _set_project_context_cache(cache_key, ctx)
+    return ctx
 
 
 class PrepareItem(BaseModel):
@@ -772,33 +1196,47 @@ async def chat_legacy(payload: ChatInput):
 @app.post("/project-chat")
 async def project_chat(payload: ProjectChatInput):
     """Chat IA par projet avec proposition de planning."""
+    is_client = (payload.user_role or "").lower() in {"particulier", "client"}
+
+    # ── Fast-path : pas besoin du contexte projet ──────────────────────────
+    trivial = _project_trivial_reply(payload.message)
+    if trivial:
+        return JSONResponse({
+            "reply": trivial,
+            "proposal": None,
+            "requires_devis": False,
+            "quick_actions": _project_quick_actions("", is_client),
+        })
+
     sb = get_client()
     if not sb:
         return JSONResponse({"reply": "Connexion Supabase indisponible.", "proposal": None, "requires_devis": True})
 
     context = _build_project_context(sb, payload.project_id, payload.user_id)
     if context.get("error") == "not_allowed":
-        return JSONResponse({"reply": "Acces refuse au projet.", "proposal": None, "requires_devis": True}, status_code=403)
+        return JSONResponse({"reply": "Accès refusé au projet.", "proposal": None, "requires_devis": True}, status_code=403)
 
     devis_count = len(context.get("devis") or [])
     devis_items_count = len(context.get("devis_items") or [])
-    has_devis = devis_count > 0 and devis_items_count > 0
+    devis_pdf_count = len(context.get("devis_pdf_texts") or [])
+    # has_devis = vrai si on a des postes détaillés OU du texte PDF extrait
+    has_devis = devis_count > 0 and (devis_items_count > 0 or devis_pdf_count > 0)
 
     now = datetime.now().astimezone()
     now_label = now.strftime("%Y-%m-%d %H:%M")
     tz_label = now.tzname() or "local"
 
-    is_client = (payload.user_role or "").lower() in {"particulier", "client"}
-    
     persona = (
         "Tu es un conseiller BTP bienveillant pour un particulier. "
-        "Ton role est de l'aider a comprendre son projet, le devis, les etapes, et les termes techniques. "
-        "Explique simplement avec des mots du quotidien, rassure, evite le jargon technique, "
-        "et propose des options concretes. Sois pedagogique et patient."
+        "Ton rôle est de l'aider à comprendre son projet, le devis, les étapes, et les termes techniques. "
+        "Explique simplement avec des mots du quotidien, rassure, évite le jargon technique, "
+        "et propose des options concrètes. Sois pédagogue et patient. "
+        "Écris en français correct avec accents et ponctuation."
         if is_client
         else "Tu es un assistant BTP expert pour un professionnel. "
-        "Ton role est de l'aider a optimiser son projet, analyser la rentabilite, verifier la conformite, "
-        "et proposer des ameliorations. Sois precis, technique quand necessaire, et oriente resultats."
+        "Ton rôle est de l'aider à optimiser son projet, analyser la rentabilité, vérifier la conformité, "
+        "et proposer des améliorations. Sois précis, technique quand nécessaire, et orienté résultats. "
+        "Écris en français correct avec accents et ponctuation."
     )
 
     client_guidance = ""
@@ -806,51 +1244,63 @@ async def project_chat(payload: ProjectChatInput):
     
     if is_client:
         client_guidance = """
-Guidance specifique pour conseiller particulier:
-- Si on te demande d'expliquer le devis: Detaille les postes principaux, explique ce qui est inclus dans chaque ligne, et donne une vision d'ensemble du budget.
-- Si on te demande les etapes: Liste les phases principales du projet (ex: preparation, travaux, finitions) avec des exemples concrets.
-- Si on te demande le budget: Resume le total, explique les postes les plus importants, et mentionne les eventuels couts supplementaires a prevoir.
-- Si on te demande de clarifier des termes: Donne une definition simple avec un exemple concret du quotidien.
-- Si on te demande les delais: Explique la duree de chaque etape et les facteurs qui peuvent influencer les delais.
-- Si on te demande des points d'attention: Mentionne les precautions importantes, les autorisations necessaires, et les risques a eviter.
-- Toujours utiliser des exemples concrets et des analogies pour faciliter la comprehension.
-"""
+ Guidance spécifique pour conseiller particulier:
+ - Si on te demande d'expliquer le devis: Détaille les postes principaux, explique ce qui est inclus dans chaque ligne, et donne une vision d'ensemble du budget.
+ - Si on te demande les étapes: Liste les phases principales du projet (ex: préparation, travaux, finitions) avec des exemples concrets.
+ - Si on te demande le budget: Résume le total, explique les postes les plus importants, et mentionne les éventuels coûts supplémentaires à prévoir.
+ - Si on te demande de clarifier des termes: Donne une définition simple avec un exemple concret du quotidien.
+ - Si on te demande les délais: Explique la durée de chaque étape et les facteurs qui peuvent influencer les délais.
+ - Si on te demande des points d'attention: Mentionne les précautions importantes, les autorisations nécessaires, et les risques à éviter.
+ - Toujours utiliser des exemples concrets et des analogies pour faciliter la compréhension.
+ - Format des montants: toujours en euros au format français (ex: 170,00 €).
+ """
     else:
         pro_guidance = """
-Guidance specifique pour assistant professionnel:
-- Si on te demande d'analyser le devis: Identifie les postes principaux, verifie les coherences, 
-  signale les ecarts potentiels, et evalue la structure tarifaire.
-- Si on te demande de verifier la conformite: Controle TVA, mentions obligatoires, references DTU, 
-  penalites de retard, RC pro, et conformite reglementaire.
-- Si on te demande de calculer les marges: Analyse la rentabilite par poste, identifie les postes 
-  les plus rentables, et signale les postes a faible marge.
-- Si on te demande d'optimiser les coûts: Propose des alternatives de materiaux ou methodes, 
-  identifie les postes surdimensionnes, et suggere des economies sans impacter la qualite.
-- Si on te demande les risques: Identifie les risques techniques, financiers, et reglementaires, 
-  et propose des mesures de mitigation.
-- Si on te demande des ameliorations: Propose des alternatives techniques, des optimisations de process, 
-  ou des ameliorations de rentabilite.
-- Toujours etre precis avec les chiffres, les references reglementaires, et les calculs.
-- Utiliser le vocabulaire technique BTP quand c'est approprie.
-"""
+ Guidance spécifique pour assistant professionnel:
+ - Si on te demande d'analyser le devis: Identifie les postes principaux, vérifie les cohérences,
+   signale les écarts potentiels, et évalue la structure tarifaire.
+ - Si on te demande de vérifier la conformité: Contrôle TVA, mentions obligatoires, références DTU,
+   pénalités de retard, RC pro, et conformité réglementaire.
+ - Si on te demande de calculer les marges: Analyse la rentabilité par poste, identifie les postes
+   les plus rentables, et signale les postes à faible marge.
+ - Si on te demande d'optimiser les coûts: Propose des alternatives de matériaux ou méthodes,
+   identifie les postes surdimensionnés, et suggère des économies sans impacter la qualité.
+ - Si on te demande les risques: Identifie les risques techniques, financiers, et réglementaires,
+   et propose des mesures de mitigation.
+ - Si on te demande des améliorations: Propose des alternatives techniques, des optimisations de process,
+   ou des améliorations de rentabilité.
+ - Toujours être précis avec les chiffres, les références réglementaires, et les calculs.
+ - Utiliser le vocabulaire technique BTP quand c'est approprié.
+ - Format des montants: toujours en euros au format français (ex: 170,00 €).
+ """
+
+    doc_rule = (
+        f"- Un document a été fourni par l'utilisateur ({payload.file_name or 'fichier'}). "
+        "Analyse-le en priorité pour répondre à la question. Cite les éléments pertinents du document dans ta réponse.\n"
+        if payload.file_context
+        else ""
+    )
 
     system_prompt = f"""
 {persona}
 {client_guidance}
 {pro_guidance}
 Regles:
-- Utilise uniquement le contexte fourni (projet, devis, messages, participants, taches).
+{doc_rule}- Le contexte fourni contient les VRAIES DONNEES du projet : postes du devis avec quantites et prix, taches, messages. Utilise ces chiffres reels dans tes reponses.
 - Ne parle jamais d'un autre projet.
 - Propose un planning uniquement si l'utilisateur le demande ou si force_plan est vrai.
 - has_devis={has_devis}. Si has_devis=True, ne demande pas d'ajouter un devis. Si has_devis=False, tu peux demander un devis mais une seule fois.
 - Reponds en JSON strict avec les cles: reply, proposal, requires_devis.
+- Dans le champ "reply", ecris la reponse COMPLETE en markdown (titres ##, listes -, gras **). Ne tronque jamais ce champ.
 - proposal est null ou {{ "summary": "...", "tasks": [ {{ "name": "", "description": "", "start_date": "YYYY-MM-DD", "end_date": "YYYY-MM-DD", "time_range": "HH:MM-HH:MM" }} ] }}.
 - Le planning ne doit pas commencer avant la date/heure actuelles.
 - Si une tache est prevue aujourd'hui, son heure de debut doit etre apres l'heure actuelle, sinon decale au lendemain.
 Style de reponse:
-- Format conseille: 1 phrase de resume + 3 puces maximum.
-- Reponds en francais clair, concis (max 8 lignes pour les questions simples, jusqu'a 12 lignes pour les explications detaillees).
-- Ne renvoie jamais d'identifiants internes ou de JSON dans reply.
+- Questions simples (statut, résumé) : 2-4 phrases, citer un chiffre clé du projet.
+- Questions d'analyse (risques, devis, optimisation, conformité, planning, marges) : réponse LONGUE et STRUCTURÉE avec titres ##, listes à puces, et CHIFFRES RÉELS extraits du contexte (montants, quantités, pourcentages calculés). Minimum 150 mots.
+- Toujours citer les données réelles du projet (noms de postes, montants, statuts de tâches).
+- Reponds TOUJOURS en francais précis et professionnel.
+- Ne renvoie jamais d'identifiants UUID ou de JSON brut dans reply.
 - Si l'utilisateur demande un autre projet, propose d'ouvrir l'autre projet ou d'en creer un nouveau.
 - Si la derniere reponse assistant est similaire a ce que tu allais dire, reformule en apportant une nouvelle information/action.
 """
@@ -866,10 +1316,15 @@ Style de reponse:
                 last_assistant = item.content
                 break
 
+    file_section = ""
+    if payload.file_context:
+        fn = payload.file_name or "fichier"
+        file_section = f"\n\nDocument fourni par l'utilisateur ({fn}):\n---\n{payload.file_context}\n---\n"
+
     user_block = f"""
 Contexte:
 {context_summary}
-
+{file_section}
 Date/heure actuelles:
 {now_label} ({tz_label})
 
@@ -884,7 +1339,7 @@ Message utilisateur:
 force_plan: {bool(payload.force_plan)}
 """
 
-    llm = get_llm()
+    llm = get_fast_llm()
     result = llm.invoke([
         SystemMessage(content=system_prompt),
         HumanMessage(content=user_block),
@@ -909,18 +1364,66 @@ force_plan: {bool(payload.force_plan)}
     # Anti-repetition et ajustement pour les particuliers
     reply_text = parsed.get("reply", "")
     if has_devis and "devis" in reply_text.lower() and ("ajout" in reply_text.lower() or "lier" in reply_text.lower()):
-        reply_text = "Le devis est deja lie au projet. Je peux analyser son contenu et proposer les prochaines etapes ou repondre a vos questions."
+        reply_text = "Le devis est déjà lié au projet. Je peux analyser son contenu et proposer les prochaines étapes ou répondre à vos questions."
     if last_assistant and reply_text.strip().lower() == last_assistant.strip().lower():
-        reply_text = reply_text + " Je peux aussi vous donner un resume rapide du projet ou des prochaines etapes, dites-moi ce que vous preferez."
+        reply_text = reply_text + " Je peux aussi vous donner un résumé rapide du projet ou des prochaines étapes, dites-moi ce que vous préférez."
 
-    parsed["reply"] = reply_text
+    if is_client and _should_show_devis_terms_ui(payload.message):
+        reply_text = _build_devis_terms_ui_reply(payload.message)
+
+    parsed["reply"] = normalize_eur_in_text(reply_text)
+    parsed["quick_actions"] = _project_quick_actions(payload.message, is_client)
 
     return JSONResponse(parsed)
+
+
+@app.post("/project-chat-file")
+async def project_chat_file(
+    project_id: str = Form(...),
+    user_id: str = Form(...),
+    message: str = Form(...),
+    user_role: Optional[str] = Form(None),
+    force_plan: Optional[bool] = Form(False),
+    file: Optional[UploadFile] = File(None),
+):
+    """Chat IA projet avec fichier joint (PDF, DOCX, image).
+    Accepte multipart/form-data. Le contenu du fichier est injecté dans le contexte.
+    """
+    file_context: str | None = None
+    file_name: str | None = None
+
+    if file and file.filename:
+        file_text, file_name = _extract_file_text(file)
+        if file_text.strip():
+            file_context = file_text[:6000]  # limite pour ne pas exploser le contexte
+        logger.info("📎 project-chat-file: fichier=%s, chars=%d", file_name, len(file_context or ""))
+
+    # On construit un ProjectChatInput enrichi avec le contenu du fichier
+    payload = ProjectChatInput(
+        project_id=project_id,
+        user_id=user_id,
+        message=message,
+        user_role=user_role,
+        force_plan=force_plan,
+        file_context=file_context,
+        file_name=file_name,
+    )
+    return await project_chat(payload)
 
 
 @app.post("/project-chat-client")
 async def project_chat_client(payload: ProjectChatInput):
     """Chat IA dédié aux particuliers (conseiller)."""
+    if _should_show_devis_terms_ui(payload.message):
+        return JSONResponse(
+            {
+                "reply": _build_devis_terms_ui_reply(payload.message),
+                "proposal": None,
+                "requires_devis": False,
+                "orchestrator": {"action": "answer", "needs_data": False, "reason": "devis_terms_ui"},
+            }
+        )
+
     # Fast answer sans données
     fast = _client_fast_reply(payload.message)
     keywords = ["projet", "planning", "tache", "tâche", "devis", "budget", "avancement", "membre", "message"]
@@ -937,6 +1440,42 @@ async def project_chat_client(payload: ProjectChatInput):
     # Sinon on délègue au flux projet avec ton conseiller (user_role=particulier)
     payload.user_role = "particulier"
     return await project_chat(payload)
+
+
+class RefreshBudgetInput(BaseModel):
+    project_id: str
+    user_id: str
+
+
+@app.post("/project-refresh-budget")
+async def project_refresh_budget(payload: RefreshBudgetInput):
+    """Extrait et met à jour le total des devis PDF liés au projet (sans items en DB).
+    Appelé après avoir lié un devis au projet pour peupler le budget estimé.
+    """
+    sb = get_client()
+    if not sb:
+        return JSONResponse({"error": "no_db"}, status_code=500)
+
+    # Invalider le cache pour forcer un re-fetch complet
+    cache_key = f"{payload.project_id}:{payload.user_id}"
+    _PROJECT_CONTEXT_CACHE.pop(cache_key, None)
+
+    # Rebuild context (télécharge et extrait les PDFs, met à jour devis.total en DB)
+    context = _build_project_context(sb, payload.project_id, payload.user_id)
+    if context.get("error") == "not_allowed":
+        return JSONResponse({"error": "not_allowed"}, status_code=403)
+
+    devis = context.get("devis") or []
+    return JSONResponse({
+        "devis": [
+            {
+                "id": d.get("id"),
+                "total": d.get("total"),
+                "status": d.get("status"),
+            }
+            for d in devis
+        ]
+    })
 
 
 @app.post("/pro-search")
@@ -1189,6 +1728,47 @@ async def prepare_devis(payload: PrepareDevisPayload):
         "corrections": corrections,
         "supabase": supabase_result,
     })
+
+
+class GenerateChecklistPdfPayload(BaseModel):
+    project_name: str | None = None
+    conversation_context: str
+    query: str | None = None
+
+
+@app.post("/generate-checklist-pdf")
+async def generate_checklist_pdf(payload: GenerateChecklistPdfPayload):
+    """Génère un PDF de checklist à partir du contexte (extraction LLM + design pro)."""
+    response_text = (payload.conversation_context or "").strip()
+    if not response_text:
+        return JSONResponse({"error": "conversation_context manquant"}, status_code=400)
+
+    extracted = extract_checklist_info_with_llm(response_text)
+
+    project_name = (str(extracted.get("project_name") or "") or "").strip()
+    if not project_name:
+        project_name = (payload.project_name or "").strip() or "Diagnostic BTP"
+
+    checkpoints = extracted.get("checkpoints") or []
+    alerts = extracted.get("alerts") or []
+    photos = extracted.get("photos") or []
+    materials = extracted.get("materials") or []
+
+    generator = ChecklistPDFGenerator()
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    pdf_path = generator.generate_checklist_pdf(
+        project_name=project_name,
+        checkpoints=[str(x) for x in checkpoints],
+        alerts=[str(x) for x in alerts],
+        photos_needed=[str(x) for x in photos],
+        materials=[str(x) for x in materials] if materials else None,
+        output_path=OUTPUT_DIR / f"checklist_{timestamp}.pdf",
+    )
+
+    filename = f"NEXTMIND_Checklist_{project_name[:20]}.pdf"
+    filename = re.sub(r"[^\\w\\s-]", "", filename).replace(" ", "_")
+
+    return FileResponse(str(pdf_path), media_type="application/pdf", filename=filename)
 
 
 @app.get("/health")
