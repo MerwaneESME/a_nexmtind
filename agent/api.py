@@ -34,6 +34,54 @@ _PROJECT_CONTEXT_CACHE: dict[str, tuple[float, dict]] = {}
 _PROJECT_CONTEXT_TTL = 45.0  # secondes
 
 
+_EURO_AMOUNT_RE = re.compile(
+    r"(?P<num>(?:\d{1,3}(?:[ \u202f.,]\d{3})+|\d+)(?:[.,]\d+)?)\s*(?:EUR|€)\b",
+    re.IGNORECASE,
+)
+
+
+def format_eur(value: int | float) -> str:
+    """Formate un montant en euros au format français (ex: 1 234,00 €)."""
+    amount = float(value)
+    raw = f"{amount:,.2f}"  # ex: 1,234.56
+    raw = raw.replace(",", "X").replace(".", ",").replace("X", "\u202f")
+    return f"{raw}\u00a0€"
+
+
+def normalize_eur_in_text(text: str) -> str:
+    """Normalise les montants 'XXX EUR' ou 'XXX€' en format français 'XXX,00 €'."""
+
+    def _parse_num(num: str) -> float | None:
+        cleaned = (num or "").replace("\u202f", "").replace(" ", "")
+        if not cleaned:
+            return None
+
+        has_comma = "," in cleaned
+        has_dot = "." in cleaned
+        if has_comma and has_dot:
+            dec_is_comma = cleaned.rfind(",") > cleaned.rfind(".")
+            if dec_is_comma:
+                cleaned = cleaned.replace(".", "").replace(",", ".")
+            else:
+                cleaned = cleaned.replace(",", "")
+        elif has_comma and not has_dot:
+            cleaned = cleaned.replace(",", ".")
+
+        try:
+            return float(cleaned)
+        except Exception:
+            return None
+
+    def _repl(match: re.Match[str]) -> str:
+        raw_num = match.group("num")
+        parsed = _parse_num(raw_num)
+        if parsed is None:
+            return match.group(0)
+        return format_eur(parsed)
+
+    return _EURO_AMOUNT_RE.sub(_repl, text or "")
+
+
 def _get_project_context_cache(key: str) -> dict | None:
     entry = _PROJECT_CONTEXT_CACHE.get(key)
     if entry and (time.monotonic() - entry[0]) < _PROJECT_CONTEXT_TTL:
@@ -693,7 +741,7 @@ def _format_project_context(context: dict) -> str:
             title = _format_devis_title(d.get("metadata")) or "Devis"
             status = d.get("status") or "brouillon"
             total = d.get("total")
-            total_label = f"{total:.2f} EUR" if isinstance(total, (int, float)) else "montant n/a"
+            total_label = format_eur(total) if isinstance(total, (int, float)) else "montant n/a"
             lines.append(f"\nDevis: {title} | Statut: {status} | Total: {total_label}")
 
             did = d.get("id") or ""
@@ -706,8 +754,8 @@ def _format_project_context(context: dict) -> str:
                     unit_price = poste.get("unit_price")
                     total_poste = poste.get("total")
                     qty_label = f"qte {qty}" if qty is not None else ""
-                    price_label = f"PU {unit_price:.2f}EUR" if isinstance(unit_price, (int, float)) else ""
-                    total_p_label = f"total {total_poste:.2f}EUR HT" if isinstance(total_poste, (int, float)) else ""
+                    price_label = f"PU {format_eur(unit_price)}" if isinstance(unit_price, (int, float)) else ""
+                    total_p_label = f"total {format_eur(total_poste)} HT" if isinstance(total_poste, (int, float)) else ""
                     detail = " | ".join(p for p in [qty_label, price_label, total_p_label] if p)
                     lines.append(f"  - {desc}" + (f" ({detail})" if detail else ""))
             elif did in pdf_by_devis:
@@ -715,7 +763,7 @@ def _format_project_context(context: dict) -> str:
                 pdf_entry = pdf_by_devis[did]
                 pdf_total = pdf_entry.get("total")
                 if isinstance(pdf_total, (int, float)):
-                    lines.append(f"  Total extrait du PDF: {pdf_total:.2f} EUR")
+                    lines.append(f"  Total extrait du PDF: {format_eur(pdf_total)}")
                 lines.append(f"  Contenu du PDF (brut, max 4000 car.):")
                 lines.append(pdf_entry["text"][:4000])
 
@@ -1166,7 +1214,7 @@ async def project_chat(payload: ProjectChatInput):
 
     context = _build_project_context(sb, payload.project_id, payload.user_id)
     if context.get("error") == "not_allowed":
-        return JSONResponse({"reply": "Acces refuse au projet.", "proposal": None, "requires_devis": True}, status_code=403)
+        return JSONResponse({"reply": "Accès refusé au projet.", "proposal": None, "requires_devis": True}, status_code=403)
 
     devis_count = len(context.get("devis") or [])
     devis_items_count = len(context.get("devis_items") or [])
@@ -1180,13 +1228,15 @@ async def project_chat(payload: ProjectChatInput):
 
     persona = (
         "Tu es un conseiller BTP bienveillant pour un particulier. "
-        "Ton role est de l'aider a comprendre son projet, le devis, les etapes, et les termes techniques. "
-        "Explique simplement avec des mots du quotidien, rassure, evite le jargon technique, "
-        "et propose des options concretes. Sois pedagogique et patient."
+        "Ton rôle est de l'aider à comprendre son projet, le devis, les étapes, et les termes techniques. "
+        "Explique simplement avec des mots du quotidien, rassure, évite le jargon technique, "
+        "et propose des options concrètes. Sois pédagogue et patient. "
+        "Écris en français correct avec accents et ponctuation."
         if is_client
         else "Tu es un assistant BTP expert pour un professionnel. "
-        "Ton role est de l'aider a optimiser son projet, analyser la rentabilite, verifier la conformite, "
-        "et proposer des ameliorations. Sois precis, technique quand necessaire, et oriente resultats."
+        "Ton rôle est de l'aider à optimiser son projet, analyser la rentabilité, vérifier la conformité, "
+        "et proposer des améliorations. Sois précis, technique quand nécessaire, et orienté résultats. "
+        "Écris en français correct avec accents et ponctuation."
     )
 
     client_guidance = ""
@@ -1194,37 +1244,39 @@ async def project_chat(payload: ProjectChatInput):
     
     if is_client:
         client_guidance = """
-Guidance specifique pour conseiller particulier:
-- Si on te demande d'expliquer le devis: Detaille les postes principaux, explique ce qui est inclus dans chaque ligne, et donne une vision d'ensemble du budget.
-- Si on te demande les etapes: Liste les phases principales du projet (ex: preparation, travaux, finitions) avec des exemples concrets.
-- Si on te demande le budget: Resume le total, explique les postes les plus importants, et mentionne les eventuels couts supplementaires a prevoir.
-- Si on te demande de clarifier des termes: Donne une definition simple avec un exemple concret du quotidien.
-- Si on te demande les delais: Explique la duree de chaque etape et les facteurs qui peuvent influencer les delais.
-- Si on te demande des points d'attention: Mentionne les precautions importantes, les autorisations necessaires, et les risques a eviter.
-- Toujours utiliser des exemples concrets et des analogies pour faciliter la comprehension.
-"""
+ Guidance spécifique pour conseiller particulier:
+ - Si on te demande d'expliquer le devis: Détaille les postes principaux, explique ce qui est inclus dans chaque ligne, et donne une vision d'ensemble du budget.
+ - Si on te demande les étapes: Liste les phases principales du projet (ex: préparation, travaux, finitions) avec des exemples concrets.
+ - Si on te demande le budget: Résume le total, explique les postes les plus importants, et mentionne les éventuels coûts supplémentaires à prévoir.
+ - Si on te demande de clarifier des termes: Donne une définition simple avec un exemple concret du quotidien.
+ - Si on te demande les délais: Explique la durée de chaque étape et les facteurs qui peuvent influencer les délais.
+ - Si on te demande des points d'attention: Mentionne les précautions importantes, les autorisations nécessaires, et les risques à éviter.
+ - Toujours utiliser des exemples concrets et des analogies pour faciliter la compréhension.
+ - Format des montants: toujours en euros au format français (ex: 170,00 €).
+ """
     else:
         pro_guidance = """
-Guidance specifique pour assistant professionnel:
-- Si on te demande d'analyser le devis: Identifie les postes principaux, verifie les coherences, 
-  signale les ecarts potentiels, et evalue la structure tarifaire.
-- Si on te demande de verifier la conformite: Controle TVA, mentions obligatoires, references DTU, 
-  penalites de retard, RC pro, et conformite reglementaire.
-- Si on te demande de calculer les marges: Analyse la rentabilite par poste, identifie les postes 
-  les plus rentables, et signale les postes a faible marge.
-- Si on te demande d'optimiser les coûts: Propose des alternatives de materiaux ou methodes, 
-  identifie les postes surdimensionnes, et suggere des economies sans impacter la qualite.
-- Si on te demande les risques: Identifie les risques techniques, financiers, et reglementaires, 
-  et propose des mesures de mitigation.
-- Si on te demande des ameliorations: Propose des alternatives techniques, des optimisations de process, 
-  ou des ameliorations de rentabilite.
-- Toujours etre precis avec les chiffres, les references reglementaires, et les calculs.
-- Utiliser le vocabulaire technique BTP quand c'est approprie.
-"""
+ Guidance spécifique pour assistant professionnel:
+ - Si on te demande d'analyser le devis: Identifie les postes principaux, vérifie les cohérences,
+   signale les écarts potentiels, et évalue la structure tarifaire.
+ - Si on te demande de vérifier la conformité: Contrôle TVA, mentions obligatoires, références DTU,
+   pénalités de retard, RC pro, et conformité réglementaire.
+ - Si on te demande de calculer les marges: Analyse la rentabilité par poste, identifie les postes
+   les plus rentables, et signale les postes à faible marge.
+ - Si on te demande d'optimiser les coûts: Propose des alternatives de matériaux ou méthodes,
+   identifie les postes surdimensionnés, et suggère des économies sans impacter la qualité.
+ - Si on te demande les risques: Identifie les risques techniques, financiers, et réglementaires,
+   et propose des mesures de mitigation.
+ - Si on te demande des améliorations: Propose des alternatives techniques, des optimisations de process,
+   ou des améliorations de rentabilité.
+ - Toujours être précis avec les chiffres, les références réglementaires, et les calculs.
+ - Utiliser le vocabulaire technique BTP quand c'est approprié.
+ - Format des montants: toujours en euros au format français (ex: 170,00 €).
+ """
 
     doc_rule = (
-        f"- Un document a ete fourni par l'utilisateur ({payload.file_name or 'fichier'}). "
-        "Analyse-le en priorite pour repondre a la question. Cite les elements pertinents du document dans ta reponse.\n"
+        f"- Un document a été fourni par l'utilisateur ({payload.file_name or 'fichier'}). "
+        "Analyse-le en priorité pour répondre à la question. Cite les éléments pertinents du document dans ta réponse.\n"
         if payload.file_context
         else ""
     )
@@ -1312,14 +1364,14 @@ force_plan: {bool(payload.force_plan)}
     # Anti-repetition et ajustement pour les particuliers
     reply_text = parsed.get("reply", "")
     if has_devis and "devis" in reply_text.lower() and ("ajout" in reply_text.lower() or "lier" in reply_text.lower()):
-        reply_text = "Le devis est deja lie au projet. Je peux analyser son contenu et proposer les prochaines etapes ou repondre a vos questions."
+        reply_text = "Le devis est déjà lié au projet. Je peux analyser son contenu et proposer les prochaines étapes ou répondre à vos questions."
     if last_assistant and reply_text.strip().lower() == last_assistant.strip().lower():
-        reply_text = reply_text + " Je peux aussi vous donner un resume rapide du projet ou des prochaines etapes, dites-moi ce que vous preferez."
+        reply_text = reply_text + " Je peux aussi vous donner un résumé rapide du projet ou des prochaines étapes, dites-moi ce que vous préférez."
 
     if is_client and _should_show_devis_terms_ui(payload.message):
         reply_text = _build_devis_terms_ui_reply(payload.message)
 
-    parsed["reply"] = reply_text
+    parsed["reply"] = normalize_eur_in_text(reply_text)
     parsed["quick_actions"] = _project_quick_actions(payload.message, is_client)
 
     return JSONResponse(parsed)
