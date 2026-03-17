@@ -32,7 +32,7 @@ class FastPathPayload(BaseModel):
     question: str | None = None
 
 
-_GREETING_RE = re.compile(r"^\s*(bonjour|salut|hello|hey|coucou|bonsoir)\b", re.IGNORECASE)
+_GREETING_RE = re.compile(r"^\s*(bonjour|salut|hello|hey|coucou|bonsoir)\b[!?.,\s]*$", re.IGNORECASE)
 _THANKS_RE = re.compile(r"\b(merci|thanks|super|parfait|top)\b", re.IGNORECASE)
 _WHO_RE = re.compile(r"^\s*(t\s*qui|t'es\s*qui|tu\s*es\s*qui|qui\s*es[- ]tu)\b", re.IGNORECASE)
 _REFERENCE_RE = re.compile(r"\b(projet(s)?\s+de\s+r[eé]f[eé]rence|r[eé]f[eé]rences?\s+projet|portfolio)\b", re.IGNORECASE)

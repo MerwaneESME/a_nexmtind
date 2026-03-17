@@ -1,4 +1,4 @@
-﻿"""API FastAPI V2 - Gestion correcte des donnÃ©es structurÃ©es."""
+"""API FastAPI V2 - Gestion correcte des donnÃ©es structurÃ©es."""
 import json
 import os
 import re
@@ -140,6 +140,9 @@ def _project_quick_actions(query: str, is_client: bool) -> list[dict]:
     if any(k in q for k in ("planning", "délai", "delai", "étape", "etape", "tâche", "tache", "calendrier")):
         actions.append({"id": "propose_plan", "label": "Proposer un planning", "prompt": "Génère un planning détaillé pour ce projet.", "icon": "📅"})
         actions.append({"id": "next_steps", "label": "Prochaines étapes", "prompt": "Quelles sont les prochaines étapes prioritaires du projet ?", "icon": "➡️"})
+
+    if any(k in q for k in ("membre", "equipe", "équipe", "rôle", "role", "permission")):
+        actions.append({"id": "team_summary", "label": "Point sur l'équipe", "prompt": "Peux-tu me faire un point sur les rôles dans le projet avec les permissions ?", "icon": "👥"})
 
     if any(k in q for k in ("devis", "conformité", "mention", "tva", "vérif", "verif")):
         actions.append({"id": "check_compliance", "label": "Vérifier la conformité", "prompt": "Vérifie la conformité réglementaire du devis (TVA, mentions obligatoires, DTU).", "icon": "✅"})
@@ -1363,8 +1366,15 @@ force_plan: {bool(payload.force_plan)}
 
     # Anti-repetition et ajustement pour les particuliers
     reply_text = parsed.get("reply", "")
-    if has_devis and "devis" in reply_text.lower() and ("ajout" in reply_text.lower() or "lier" in reply_text.lower()):
+    
+    # Correction : On ne déclenche le message "déjà lié" que si le message utilisateur semble vouloir lier un devis
+    # et que la réponse de l'IA est trop générique ou répétitive à ce sujet.
+    wants_to_link = any(k in payload.message.lower() for k in ("lier", "ajouter", "mettre", "joint", "televerser", "uploader"))
+    is_quote_mention = "devis" in reply_text.lower()
+    
+    if has_devis and wants_to_link and is_quote_mention and ("ajout" in reply_text.lower() or "lier" in reply_text.lower()):
         reply_text = "Le devis est déjà lié au projet. Je peux analyser son contenu et proposer les prochaines étapes ou répondre à vos questions."
+    
     if last_assistant and reply_text.strip().lower() == last_assistant.strip().lower():
         reply_text = reply_text + " Je peux aussi vous donner un résumé rapide du projet ou des prochaines étapes, dites-moi ce que vous préférez."
 
