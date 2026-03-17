@@ -9,8 +9,8 @@ from .config import InvoiceSchema, QuoteSchema
 
 
 def get_client() -> Optional[Client]:
-    url = os.getenv("SUPABASE_URL")
-    key = os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_ANON_KEY")
+    url = os.getenv("SUPABASE_URL") or os.getenv("NEXT_PUBLIC_SUPABASE_URL")
+    key = os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("NEXT_PUBLIC_SUPABASE_ANON_KEY") or os.getenv("SUPABASE_ANON_KEY")
     if not url or not key:
         return None
     return create_client(url, key)
@@ -122,5 +122,40 @@ def upsert_document(data: dict):
             return insert_invoice(sb, data)
         else:
             return insert_quote(sb, data)
+    except Exception as exc:
+        return {"error": str(exc)}
+
+
+def register_user_admin(email: str, password: str, full_name: str, user_type: str):
+    """Crée un utilisateur Supabase et le confirme immédiatement via l'API Admin."""
+    sb = get_client()
+    if not sb:
+        return {"error": "Supabase client non configuré"}
+
+    try:
+        # 1. Création de l'utilisateur avec email_confirm=True via l'API Admin
+        auth_response = sb.auth.admin.create_user({
+            "email": email,
+            "password": password,
+            "email_confirm": True,
+            "user_metadata": {"full_name": full_name, "user_type": user_type}
+        })
+        
+        user = auth_response.user
+        if not user:
+            return {"error": "Échec de la création de l'utilisateur admin"}
+
+        # 2. Création/Mise à jour du profil associé
+        profile_data = {
+            "id": user.id,
+            "email": email,
+            "full_name": full_name,
+            "user_type": user_type
+        }
+        
+        # On utilise upsert pour s'assurer que le profil existe
+        sb.table("profiles").upsert(profile_data, on_conflict="id").execute()
+        
+        return {"user_id": user.id, "success": True}
     except Exception as exc:
         return {"error": str(exc)}

@@ -21,10 +21,50 @@ from api.chat import ChatInput as OptimizedChatInput
 from api.chat import handle_chat_non_stream, router as optimized_chat_router
 from .runtime import invoke_agent
 from .config import get_fast_llm, get_llm
-from .supabase_client import get_client, upsert_document
+from .supabase_client import get_client, upsert_document, register_user_admin
 from .tools import calculate_totals_tool, clean_lines_tool, supabase_lookup_tool, validate_devis_tool
 from .logging_config import logger
 from .utils.pdf_generator import ChecklistPDFGenerator, extract_checklist_info_with_llm
+
+# ==================== Modèles Pydantic ====================
+
+class ChatHistoryItem(BaseModel):
+    role: Literal["user", "assistant", "system"]
+    content: str
+
+
+class ChatInput(BaseModel):
+    message: str
+    thread_id: Optional[str] = None
+    history: Optional[List[ChatHistoryItem]] = None
+    metadata: Optional[Dict[str, Any]] = None
+    force_prepare: Optional[bool] = None
+
+
+class ProjectChatInput(BaseModel):
+    project_id: str
+    user_id: str
+    message: str
+    history: Optional[List[ChatHistoryItem]] = None
+    force_plan: Optional[bool] = None
+    user_role: Optional[str] = None
+    file_context: Optional[str] = None   # contenu extrait d'un fichier joint
+    file_name: Optional[str] = None      # nom du fichier joint
+
+
+class RegisterInput(BaseModel):
+    email: str
+    password: str
+    full_name: str
+    user_type: str
+
+
+class ProSearchInput(BaseModel):
+    message: str
+    city: Optional[str] = None
+    postal_code: Optional[str] = None
+    limit: int = Field(20, ge=1, le=50)
+
 
 # Cache par thread_id pour garder le dernier formulaire
 SESSION_PAYLOADS: dict[str, dict] = {}
@@ -190,6 +230,20 @@ if OUTPUT_DIR.exists():
 
 # Optimized /chat endpoint (JSON + SSE streaming)
 app.include_router(optimized_chat_router)
+
+
+@app.post("/register")
+async def register(payload: RegisterInput):
+    """Inscription forcée (bypass email confirmation) via Supabase Admin."""
+    result = register_user_admin(
+        email=payload.email,
+        password=payload.password,
+        full_name=payload.full_name,
+        user_type=payload.user_type
+    )
+    if "error" in result:
+        return JSONResponse(result, status_code=400)
+    return JSONResponse(result)
 
 
 def save_upload(file: UploadFile) -> str:
@@ -511,38 +565,6 @@ def _build_devis_terms_ui_reply(message: str) -> str:
         "et je vous l’explique ligne par ligne."
     )
 
-
-# ==================== ModÃ¨les Pydantic ====================
-
-class ChatHistoryItem(BaseModel):
-    role: Literal["user", "assistant", "system"]
-    content: str
-
-
-class ChatInput(BaseModel):
-    message: str
-    thread_id: Optional[str] = None
-    history: Optional[List[ChatHistoryItem]] = None
-    metadata: Optional[Dict[str, Any]] = None
-    force_prepare: Optional[bool] = None
-
-
-class ProjectChatInput(BaseModel):
-    project_id: str
-    user_id: str
-    message: str
-    history: Optional[List[ChatHistoryItem]] = None
-    force_plan: Optional[bool] = None
-    user_role: Optional[str] = None
-    file_context: Optional[str] = None   # contenu extrait d'un fichier joint
-    file_name: Optional[str] = None      # nom du fichier joint
-
-
-class ProSearchInput(BaseModel):
-    message: str
-    city: Optional[str] = None
-    postal_code: Optional[str] = None
-    limit: int = Field(20, ge=1, le=50)
 
 
 def _maybe_parse_json(text: str) -> Any:
@@ -1779,6 +1801,20 @@ async def generate_checklist_pdf(payload: GenerateChecklistPdfPayload):
     filename = re.sub(r"[^\\w\\s-]", "", filename).replace(" ", "_")
 
     return FileResponse(str(pdf_path), media_type="application/pdf", filename=filename)
+
+
+@app.post("/register")
+async def register(payload: RegisterInput):
+    """Inscription forcée (bypass email confirmation) via Supabase Admin."""
+    result = register_user_admin(
+        email=payload.email,
+        password=payload.password,
+        full_name=payload.full_name,
+        user_type=payload.user_type
+    )
+    if "error" in result:
+        return JSONResponse(result, status_code=400)
+    return JSONResponse(result)
 
 
 @app.get("/health")
