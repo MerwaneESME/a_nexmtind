@@ -246,6 +246,88 @@ async def register(payload: RegisterInput):
     return JSONResponse(result)
 
 
+# ==================== Budget PDF Refresh ====================
+
+class RefreshBudgetInput(BaseModel):
+    project_id: str
+    user_id: str
+
+
+@app.post("/project-refresh-budget")
+async def project_refresh_budget(payload: RefreshBudgetInput):
+    """Extrait le Total TTC des devis PDF externes liés au projet et met à jour devis.total.
+
+    Appelé par le front après avoir lié un devis PDF ou l'avoir validé.
+    Retourne { "devis": [{ "id": "...", "total": 1234.56 | null }] }
+    """
+    sb = get_client()
+    project_id = payload.project_id
+    user_id = payload.user_id
+
+    # Vérification d'accès (membre du projet)
+    membership = (
+        sb.table("project_members")
+        .select("id")
+        .eq("project_id", project_id)
+        .eq("user_id", user_id)
+        .limit(1)
+        .execute()
+    )
+    if not membership.data:
+        return JSONResponse({"error": "not_allowed"}, status_code=403)
+
+    # Récupérer tous les devis du projet
+    devis_rows = (
+        sb.table("devis")
+        .select("id,total,metadata")
+        .eq("project_id", project_id)
+        .execute()
+    ).data or []
+
+    updated: list[dict] = []
+
+    for dv in devis_rows:
+        dv_id = dv.get("id") or ""
+        current_total = dv.get("total")
+        meta = dv.get("metadata") or {}
+
+        # Ignorer les devis sans PDF (ex: devis créés via le formulaire, déjà avec total)
+        has_pdf = isinstance(meta, dict) and (meta.get("pdf_bucket") or meta.get("pdf_url"))
+        if not has_pdf:
+            updated.append({"id": dv_id, "total": current_total})
+            continue
+
+        # Toujours tenter l'extraction si total NULL ; re-tenter si total connu (idempotent)
+        if current_total is not None:
+            updated.append({"id": dv_id, "total": current_total})
+            continue
+
+        pdf_text = _download_devis_pdf_text(sb, dv)
+        if not pdf_text:
+            logger.warning("project_refresh_budget: no PDF text for devis %s (meta=%s)", dv_id, list(meta.keys()))
+            updated.append({"id": dv_id, "total": None})
+            continue
+
+        extracted = _extract_total_from_pdf_text(pdf_text)
+        if extracted is not None:
+            try:
+                sb.table("devis").update({"total": extracted}).eq("id", dv_id).execute()
+                logger.info("project_refresh_budget: ✅ devis %s total=%s", dv_id, extracted)
+                updated.append({"id": dv_id, "total": extracted})
+            except Exception as exc:
+                logger.error("project_refresh_budget: update failed for %s: %s", dv_id, exc)
+                updated.append({"id": dv_id, "total": None})
+        else:
+            logger.warning("project_refresh_budget: could not extract total from PDF (devis %s)", dv_id)
+            updated.append({"id": dv_id, "total": None})
+
+    # Invalider le cache de contexte projet pour forcer un rafraîchissement au prochain chat
+    cache_key = f"{project_id}:{user_id}"
+    _PROJECT_CONTEXT_CACHE.pop(cache_key, None)
+
+    return JSONResponse({"devis": updated})
+
+
 def save_upload(file: UploadFile) -> str:
     fd, path = tempfile.mkstemp(suffix=f"_{file.filename}")
     with os.fdopen(fd, "wb") as fh:
@@ -339,25 +421,103 @@ def _download_devis_pdf_text(sb, devis_row: dict) -> str | None:
         return None
 
 
+def _parse_french_number(raw: str) -> float | None:
+    """Parse un nombre au format français ou international (ex: '3 888,50' ou '3.888,50' ou '3888.50')."""
+    cleaned = (raw or "").replace("\u202f", "").replace("\u00a0", "").replace(" ", "")
+    if not cleaned:
+        return None
+    # "3.888,50" → point=milliers, virgule=déc  |  "3,888.50" → virgule=milliers, point=déc
+    if "," in cleaned and "." in cleaned:
+        if cleaned.rfind(",") > cleaned.rfind("."):
+            # virgule = décimale (format FR)
+            cleaned = cleaned.replace(".", "").replace(",", ".")
+        else:
+            # point = décimale (format EN)
+            cleaned = cleaned.replace(",", "")
+    elif "," in cleaned:
+        # virgule unique = décimale FR
+        cleaned = cleaned.replace(",", ".")
+    try:
+        val = float(cleaned)
+        return val if val > 0 else None
+    except Exception:
+        return None
+
+
 def _extract_total_from_pdf_text(text: str) -> float | None:
-    """Tente d'extraire le montant total d'un PDF (recherche Total TTC / HT)."""
+    """Tente d'extraire le montant Total TTC d'un texte PDF (devis/facture BTP).
+
+    Gère :
+    - Espaces insécables Unicode (\\u202f, \\u00a0) dans les montants
+    - Label et montant sur lignes séparées (ex: 'TOTAL TTC\\n3 888,50')
+    - Format français '3 888,50' et '3.888,50' (point = séparateur milliers)
+    - Variantes : 'Net à payer TTC', 'Montant TTC', 'TOTAL'
+    - Fallback sur le plus grand montant € du document
+    """
     if not text:
         return None
-    # Patterns: "Total TTC : 12 345,67 €" ou "TOTAL 12345.67" etc.
-    patterns = [
-        r"[Tt]otal\s+[Tt][Tt][Cc]\s*[:\s]+(\d[\d\s]*[.,]\d{2})",
-        r"[Tt]otal\s+[Hh][Tt]\s*[:\s]+(\d[\d\s]*[.,]\d{2})",
-        r"TOTAL\s*[:\s]+(\d[\d\s]*[.,]\d{2})",
-        r"[Mm]ontant\s+[Tt][Tt][Cc]\s*[:\s]+(\d[\d\s]*[.,]\d{2})",
+
+    # Normaliser les espaces insécables pour simplifier les regex
+    normalized = (
+        text
+        .replace("\u202f", " ")
+        .replace("\u00a0", " ")
+        .replace("\u2019", "'")
+    )
+
+    # ── Motif numérique générique ────────────────────────────────────────
+    _NUM = r"([\d][\d\s]{0,12}[.,]\d{2})"
+
+    # ── Patterns TTC prioritaires ────────────────────────────────────────
+    # Ordre : du plus spécifique au plus générique
+    ttc_patterns = [
+        # "Total TTC : 3 888,50" ou "Total TTC 3 888,50 €"  (même ligne)
+        rf"(?:total\s+ttc|net\s+[àa]\s+payer(?:\s+ttc)?|montant\s+ttc)"
+        rf"[\s:]*" + _NUM,
+        # "TOTAL TTC\n   3 888,50"  (montant sur ligne suivante)
+        rf"(?:total\s+ttc|net\s+[àa]\s+payer(?:\s+ttc)?|montant\s+ttc)"
+        rf"[\s:]*\n\s*" + _NUM,
+        # "TOTAL\n3888,50" (générique)
+        r"TOTAL[\s:]*\n\s*" + _NUM,
+        # "TOTAL : 3 888,50"
+        r"TOTAL[\s:]+" + _NUM,
     ]
-    for pat in patterns:
-        match = re.search(pat, text)
-        if match:
-            raw = match.group(1).replace(" ", "").replace(",", ".")
-            try:
-                return float(raw)
-            except Exception:
-                continue
+
+    # ── Patterns HT (fallback si aucun TTC trouvé) ───────────────────────
+    ht_patterns = [
+        rf"(?:total\s+h\.?t\.?|montant\s+h\.?t\.?)[\s:]+" + _NUM,
+        rf"(?:total\s+h\.?t\.?|montant\s+h\.?t\.?)[\s:]*\n\s*" + _NUM,
+    ]
+
+    for pat in ttc_patterns:
+        m = re.search(pat, normalized, re.IGNORECASE)
+        if m:
+            val = _parse_french_number(m.group(1))
+            if val is not None:
+                logger.debug("_extract_total_from_pdf_text: TTC match '%s' → %s", m.group(1), val)
+                return val
+
+    for pat in ht_patterns:
+        m = re.search(pat, normalized, re.IGNORECASE)
+        if m:
+            val = _parse_french_number(m.group(1))
+            if val is not None:
+                logger.debug("_extract_total_from_pdf_text: HT fallback '%s' → %s", m.group(1), val)
+                return val
+
+    # ── Fallback générique : plus grand montant € du document ────────────
+    # Utile quand le libellé "TOTAL TTC" est très différent ou mal extrait par pypdf.
+    candidates: list[float] = []
+    for m in _EURO_AMOUNT_RE.finditer(normalized):
+        val = _parse_french_number(m.group("num"))
+        if val is not None:
+            candidates.append(val)
+
+    if candidates:
+        best = max(candidates)
+        logger.debug("_extract_total_from_pdf_text: € fallback → %s (from %d candidates)", best, len(candidates))
+        return best
+
     return None
 
 
