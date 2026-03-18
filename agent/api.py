@@ -834,17 +834,15 @@ def _parse_time_range_start(value: str | None) -> tuple[int, int] | None:
 
 
 def _apply_planning_guardrails(proposal: dict, now: datetime) -> dict:
-    tasks = proposal.get("tasks")
-    if not isinstance(tasks, list):
-        return proposal
     today = now.date()
-    for task in tasks:
+
+    def _shift_task(task: dict) -> None:
         if not isinstance(task, dict):
-            continue
+            return
         start_date = _parse_date(task.get("start_date"))
         end_date = _parse_date(task.get("end_date")) or start_date
         if not start_date:
-            continue
+            return
         shift_days = 0
         if start_date < today:
             shift_days = (today - start_date).days
@@ -860,7 +858,23 @@ def _apply_planning_guardrails(proposal: dict, now: datetime) -> dict:
                 end_date = end_date + timedelta(days=shift_days)
             task["start_date"] = start_date.isoformat()
             task["end_date"] = (end_date or start_date).isoformat()
-    proposal["tasks"] = tasks
+
+    # Legacy format: flat tasks[]
+    tasks = proposal.get("tasks")
+    if isinstance(tasks, list):
+        for task in tasks:
+            _shift_task(task)
+
+    # Enriched format: existing_interventions[].suggested_tasks[] and suggested_interventions[].suggested_tasks[]
+    for intervention in (proposal.get("existing_interventions") or []):
+        if isinstance(intervention, dict):
+            for task in (intervention.get("suggested_tasks") or []):
+                _shift_task(task)
+    for intervention in (proposal.get("suggested_interventions") or []):
+        if isinstance(intervention, dict):
+            for task in (intervention.get("suggested_tasks") or []):
+                _shift_task(task)
+
     return proposal
 
 def _build_project_context(sb, project_id: str, user_id: str) -> dict:
@@ -1317,7 +1331,35 @@ Regles:
 - has_devis={has_devis}. Si has_devis=True, ne demande pas d'ajouter un devis. Si has_devis=False, tu peux demander un devis mais une seule fois.
 - Reponds en JSON strict avec les cles: reply, proposal, requires_devis.
 - Dans le champ "reply", ecris la reponse COMPLETE en markdown (titres ##, listes -, gras **). Ne tronque jamais ce champ.
-- proposal est null ou {{ "summary": "...", "tasks": [ {{ "name": "", "description": "", "start_date": "YYYY-MM-DD", "end_date": "YYYY-MM-DD", "time_range": "HH:MM-HH:MM" }} ] }}.
+- proposal est null si pas de planning demande. Si l'utilisateur demande un planning ou si force_plan est vrai, proposal DOIT contenir un objet JSON structure comme suit:
+  {{
+    "summary": "Synthese en 2-3 phrases",
+    "existing_interventions": [
+      {{
+        "intervention_id": "uuid-existant-ou-vide",
+        "intervention_name": "Nom intervention existante",
+        "existing_tasks": [
+          {{ "task_id": "uuid", "title": "Titre", "status": "todo|in_progress|done", "due_date": "YYYY-MM-DD", "note": "Remarque" }}
+        ],
+        "suggested_tasks": [
+          {{ "title": "Nouvelle tache", "description": "Pourquoi", "start_date": "YYYY-MM-DD", "end_date": "YYYY-MM-DD" }}
+        ]
+      }}
+    ],
+    "suggested_interventions": [
+      {{
+        "name": "Nom intervention proposee",
+        "lot_type": "Type (Electricite, Plomberie, etc.)",
+        "reason": "Justification",
+        "suggested_tasks": [
+          {{ "title": "Tache", "description": "Description", "start_date": "YYYY-MM-DD", "end_date": "YYYY-MM-DD" }}
+        ]
+      }}
+    ],
+    "warnings": ["Alertes eventuelles"],
+    "next_week_priorities": ["Priorites de la semaine"]
+  }}
+- IMPORTANT: Si force_plan est vrai, tu DOIS generer un planning complet avec au minimum 3 interventions et des taches concretes basees sur le devis et le type de projet. Ne renvoie JAMAIS un proposal vide ou null quand force_plan est vrai.
 - Le planning ne doit pas commencer avant la date/heure actuelles.
 - Si une tache est prevue aujourd'hui, son heure de debut doit etre apres l'heure actuelle, sinon decale au lendemain.
 Style de reponse:
