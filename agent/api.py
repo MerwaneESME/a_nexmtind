@@ -440,7 +440,7 @@ def _download_devis_pdf_text(sb, devis_row: dict) -> str | None:
     if not pdf_bytes and pdf_url:
         try:
             import urllib.request
-            req = urllib.request.Request(pdf_url, headers={"User-Agent": "NextMind/1.0"})
+            req = urllib.request.Request(pdf_url, headers={"User-Agent": "Artisia/1.0"})
             with urllib.request.urlopen(req, timeout=8) as resp:
                 pdf_bytes = resp.read()
         except Exception as exc:
@@ -2127,7 +2127,7 @@ async def generate_checklist_pdf(payload: GenerateChecklistPdfPayload):
         output_path=OUTPUT_DIR / f"checklist_{timestamp}.pdf",
     )
 
-    filename = f"NEXTMIND_Checklist_{project_name[:20]}.pdf"
+    filename = f"ARTISIA_Checklist_{project_name[:20]}.pdf"
     filename = re.sub(r"[^\\w\\s-]", "", filename).replace(" ", "_")
 
     return FileResponse(str(pdf_path), media_type="application/pdf", filename=filename)

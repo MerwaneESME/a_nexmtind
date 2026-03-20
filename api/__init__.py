@@ -1,2 +1,2 @@
-"""FastAPI routers for the NEXTMIND backend."""
+"""FastAPI routers for the ARTISIA backend."""
 

@@ -1,4 +1,4 @@
-"""Redis cache utilities for the NEXTMIND chat pipeline.
+"""Redis cache utilities for the ARTISIA chat pipeline.
 
 The cache is intentionally simple:
 - key: normalized user question (see `normalize_question`)
@@ -52,7 +52,7 @@ class RedisChatCache:
         self,
         redis: Optional["Redis"],
         *,
-        key_prefix: str = "nextmind:chat:",
+        key_prefix: str = "artisia:chat:",
         default_ttl_seconds: int = 900,
     ) -> None:
         self._redis = redis
@@ -146,7 +146,7 @@ def get_chat_cache() -> RedisChatCache:
 
     redis_url = os.getenv("REDIS_URL", "").strip()
     ttl = int(os.getenv("REDIS_CHAT_TTL_SECONDS", "900"))
-    prefix = os.getenv("REDIS_CHAT_KEY_PREFIX", "nextmind:chat:")
+    prefix = os.getenv("REDIS_CHAT_KEY_PREFIX", "artisia:chat:")
 
     if not redis_url or Redis is None:
         _CACHE_SINGLETON = RedisChatCache(None, key_prefix=prefix, default_ttl_seconds=ttl)

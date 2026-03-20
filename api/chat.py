@@ -1,4 +1,4 @@
-"""Streaming /chat endpoint for the optimized NEXTMIND pipeline.
+"""Streaming /chat endpoint for the optimized ARTISIA pipeline.
 
 Supports:
 - JSON response (legacy-compatible)

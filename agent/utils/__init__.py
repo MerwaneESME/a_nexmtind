@@ -1,2 +1,2 @@
-"""Small utility modules for the NEXTMIND agent."""
+"""Small utility modules for the ARTISIA agent."""
 

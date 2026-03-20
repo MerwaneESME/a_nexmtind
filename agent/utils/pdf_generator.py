@@ -517,16 +517,17 @@ class ChecklistPDFGenerator:
             )
 
     def _find_logo_path(self) -> Path | None:
-        env_path = os.getenv("NEXTMIND_LOGO_PATH")
+        env_path = os.getenv("ARTISIA_LOGO_PATH")
         candidates: list[Path] = []
         if env_path:
             candidates.append(Path(env_path))
 
         candidates.extend(
             [
-                Path.cwd() / "public" / "images" / "nextmind.png",
-                Path.cwd().parent / "NextMind-main" / "public" / "images" / "nextmind.png",
-                Path(__file__).resolve().parents[2] / "public" / "images" / "nextmind.png",
+                # Logo used in generated PDFs (keep the filename aligned with `public/images`).
+                Path.cwd() / "public" / "images" / "artisia_bgremove.png",
+                Path.cwd().parent / "Artisia-main" / "public" / "images" / "artisia_bgremove.png",
+                Path(__file__).resolve().parents[2] / "public" / "images" / "artisia_bgremove.png",
             ]
         )
 
@@ -696,7 +697,7 @@ class ChecklistPDFGenerator:
             Spacer(1, 0.6 * cm),
             line,
             Spacer(1, 0.25 * cm),
-            Paragraph("Document généré par NEXTMIND", self.styles["FooterPrimary"]),
+            Paragraph("Document généré par ARTISIA", self.styles["FooterPrimary"]),
             Spacer(1, 0.08 * cm),
             Paragraph("Assistant IA BTP professionnel", self.styles["FooterSecondary"]),
         ]
@@ -734,7 +735,7 @@ class ChecklistPDFGenerator:
             content.append(logo)
             content.append(Spacer(1, 0.18 * cm))
         else:
-            content.append(Paragraph("NEXTMIND", self.styles["CustomTitle"]))
+            content.append(Paragraph("ARTISIA", self.styles["CustomTitle"]))
 
         content.append(Paragraph("Checklist Diagnostic BTP", self.styles["CustomSubtitle"]))
         content.append(self._separator_line(doc.width))

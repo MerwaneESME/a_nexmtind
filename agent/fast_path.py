@@ -77,7 +77,7 @@ _FAST_PATH_META_RE = re.compile(r"\b(sens\s+de\s+la\s+vie|metaphys|philosoph)\b"
 
 
 _FAST_PATH_SYSTEM_PROMPT = (
-    "Tu es NEXTMIND, assistant BTP France, en mode réponse rapide.\n"
+    "Tu es ARTISIA, assistant BTP France, en mode réponse rapide.\n"
     "\n"
     "Réponds en 2-4 lignes maximum, style professionnel chantier.\n"
     "Si possible, donne AU MOINS 1 info concrète utile (ordre de grandeur prix, durée typique, matériau courant, ou point de vigilance).\n"
@@ -96,7 +96,7 @@ def _heuristic_fast_reply(message: str) -> str | None:
         return "Je peux t'aider sur tes devis/factures BTP. Quelle est ta question ?"
 
     if _WHO_RE.search(msg):
-        return "Je suis NEXTMIND, ton assistant IA BTP (devis, factures, travaux, matériaux, conformité)."
+        return "Je suis ARTISIA, ton assistant IA BTP (devis, factures, travaux, matériaux, conformité)."
 
     if _GREETING_RE.search(msg):
         return "Bonjour ! Dis-moi ce dont tu as besoin (devis, facture, estimation, travaux, matériaux…)."

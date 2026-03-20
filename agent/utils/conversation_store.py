@@ -27,7 +27,7 @@ class ConversationStore:
         self,
         redis: Optional["Redis"],
         *,
-        key_prefix: str = "nextmind:conversation:",
+        key_prefix: str = "artisia:conversation:",
         ttl_seconds: int = 3600 * 24,
     ) -> None:
         self._redis = redis
@@ -98,7 +98,7 @@ def get_conversation_store() -> ConversationStore:
     Env:
     - REDIS_URL: e.g. redis://localhost:6379/0
     - REDIS_CONVERSATION_TTL_SECONDS (optional): default 86400
-    - REDIS_CONVERSATION_KEY_PREFIX (optional): default nextmind:conversation:
+    - REDIS_CONVERSATION_KEY_PREFIX (optional): default artisia:conversation:
     """
     global _STORE_SINGLETON
     if _STORE_SINGLETON is not None:
@@ -106,7 +106,7 @@ def get_conversation_store() -> ConversationStore:
 
     redis_url = os.getenv("REDIS_URL", "").strip()
     ttl = int(os.getenv("REDIS_CONVERSATION_TTL_SECONDS", "86400"))
-    prefix = os.getenv("REDIS_CONVERSATION_KEY_PREFIX", "nextmind:conversation:")
+    prefix = os.getenv("REDIS_CONVERSATION_KEY_PREFIX", "artisia:conversation:")
 
     if not redis_url or Redis is None:
         _STORE_SINGLETON = ConversationStore(None, key_prefix=prefix, ttl_seconds=ttl)
