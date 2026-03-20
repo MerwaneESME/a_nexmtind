@@ -7,10 +7,12 @@ import time
 import unicodedata
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta
+from datetime import date, datetime
+import re
 from pathlib import Path
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional, Annotated
 
-from fastapi import FastAPI, File, Form, UploadFile
+from fastapi import FastAPI, File, Form, UploadFile, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -25,6 +27,8 @@ from .supabase_client import get_client, upsert_document, register_user_admin
 from .tools import calculate_totals_tool, clean_lines_tool, supabase_lookup_tool, validate_devis_tool
 from .logging_config import logger
 from .utils.pdf_generator import ChecklistPDFGenerator, extract_checklist_info_with_llm
+from .services.pro_tag_scorer import ProTagScorer
+
 
 # ==================== Modèles Pydantic ====================
 
@@ -64,6 +68,41 @@ class ProSearchInput(BaseModel):
     city: Optional[str] = None
     postal_code: Optional[str] = None
     limit: int = Field(20, ge=1, le=50)
+
+
+class CreateLotInput(BaseModel):
+    phase_id: str
+    name: str
+    description: Optional[str] = None
+    lot_type: Optional[str] = None
+    company_name: Optional[str] = None
+    company_contact_name: Optional[str] = None
+    company_contact_email: Optional[str] = None
+    company_contact_phone: Optional[str] = None
+    responsible_user_id: Optional[str] = None
+    start_date: Optional[str] = None
+    end_date: Optional[str] = None
+    budget_estimated: Optional[float] = 0
+    status: Optional[str] = "planifie"
+
+
+class UpdateLotInput(BaseModel):
+    lot_id: str
+    name: Optional[str] = None
+    description: Optional[str] = None
+    lot_type: Optional[str] = None
+    company_name: Optional[str] = None
+    company_contact_name: Optional[str] = None
+    company_contact_email: Optional[str] = None
+    company_contact_phone: Optional[str] = None
+    responsible_user_id: Optional[str] = None
+    start_date: Optional[str] = None
+    end_date: Optional[str] = None
+    budget_estimated: Optional[float] = None
+    budget_actual: Optional[float] = None
+    status: Optional[str] = None
+    progress_percentage: Optional[int] = None
+
 
 
 # Cache par thread_id pour garder le dernier formulaire
@@ -1785,14 +1824,14 @@ async def pro_search(payload: ProSearchInput):
 
     profiles_rows = (
         sb.table("public_pro_profiles")
-        .select("pro_id,display_name,company_name,city,postal_code,company_description,company_website,email,phone,address")
+        .select("pro_id,display_name,company_name,city,postal_code,company_description,company_website,email,phone,address,rating_avg,rating_count")
         .in_("pro_id", ranked_ids)
         .execute()
     ).data or []
 
     profiles_by_id = {row.get("pro_id"): row for row in profiles_rows}
     results: list[dict] = []
-    for pro_id, score in ranked:
+    for pro_id, base_score in ranked:
         profile = profiles_by_id.get(pro_id)
         if not profile:
             continue
@@ -1800,17 +1839,106 @@ async def pro_search(payload: ProSearchInput):
             continue
         if postal_code and postal_code not in (profile.get("postal_code") or ""):
             continue
+        
+        # Calcul du score composite: 70% tag_score + 30% rating_bonus
+        # rating_bonus = (rating_avg / 5) * 1.0 (si rating_count > 0)
+        rating_avg = float(profile.get("rating_avg") or 0)
+        rating_bonus = rating_avg / 5.0
+        composite_score = (base_score * 0.7) + (rating_bonus * 0.3)
+        
         enriched = dict(profile)
-        enriched["score"] = round(score, 4)
+        enriched["base_tag_score"] = round(base_score, 4)
+        enriched["score"] = round(composite_score, 4)
         enriched["matched_tags"] = matched_tags.get(pro_id, [])
         results.append(enriched)
-        if len(results) >= payload.limit:
-            break
+
+    # Re-trier par score composite final
+    results.sort(key=lambda x: x["score"], reverse=True)
 
     return JSONResponse({
         "interpreted": {"tags": tags, "city": city, "postal_code": postal_code},
-        "results": results,
+        "results": results[:payload.limit],
     })
+
+
+@app.post("/admin/recompute-pro-tags")
+async def admin_recompute_pro_tags(background_tasks: BackgroundTasks, pro_id: Optional[str] = None):
+    """Force le recalcul des scores pour un pro ou pour tous."""
+    scorer = ProTagScorer()
+    background_tasks.add_task(scorer.compute_and_upsert_scores, pro_id)
+    return {"status": "accepted", "message": f"Recalcul lancé pour {'tous' if not pro_id else pro_id}"}
+
+
+@app.post("/rpc-create-lot")
+async def rpc_create_lot(payload: CreateLotInput, background_tasks: BackgroundTasks):
+    """Wrapper pour rpc_create_lot avec hook de scoring."""
+    sb = get_client()
+    params = {
+        "p_phase_id": payload.phase_id,
+        "p_name": payload.name,
+        "p_description": payload.description,
+        "p_lot_type": payload.lot_type,
+        "p_company_name": payload.company_name,
+        "p_company_contact_name": payload.company_contact_name,
+        "p_company_contact_email": payload.company_contact_email,
+        "p_company_contact_phone": payload.company_contact_phone,
+        "p_responsible_user_id": payload.responsible_user_id,
+        "p_start_date": payload.start_date,
+        "p_end_date": payload.end_date,
+        "p_budget_estimated": payload.budget_estimated,
+        "p_status": payload.status,
+    }
+    
+    result = sb.rpc("rpc_create_lot", params).execute()
+    if not result.data:
+        return JSONResponse({"error": "creation_failed"}, status_code=500)
+    
+    lot_id = result.data
+    scorer = ProTagScorer()
+    background_tasks.add_task(scorer.trigger_on_lot_update, str(lot_id))
+    
+    return {"lot_id": lot_id}
+
+
+@app.post("/rpc-update-lot")
+async def rpc_update_lot(payload: UpdateLotInput, background_tasks: BackgroundTasks):
+    """Wrapper pour rpc_update_lot avec hook de scoring."""
+    sb = get_client()
+    # On ne passe que les champs non-nulls pour matcher Partial en TS
+    params = {"p_lot_id": payload.lot_id}
+    data = payload.dict(exclude_unset=True)
+    
+    mapping = {
+        "name": "p_name",
+        "description": "p_description",
+        "lot_type": "p_lot_type",
+        "company_name": "p_company_name",
+        "company_contact_name": "p_company_contact_name",
+        "company_contact_email": "p_company_contact_email",
+        "company_contact_phone": "p_company_contact_phone",
+        "responsible_user_id": "p_responsible_user_id",
+        "start_date": "p_start_date",
+        "end_date": "p_end_date",
+        "budget_estimated": "p_budget_estimated",
+        "budget_actual": "p_budget_actual",
+        "status": "p_status",
+        "progress_percentage": "p_progress_percentage",
+    }
+    
+    for k, v in data.items():
+        if k in mapping:
+            params[mapping[k]] = v
+
+    sb.rpc("rpc_update_lot", params).execute()
+    
+    # Déclencher le hook
+    scorer = ProTagScorer()
+    background_tasks.add_task(scorer.trigger_on_lot_update, str(payload.lot_id))
+    
+    return {"status": "ok"}
+
+
+
 
 
 @app.post("/validate-section")
