@@ -799,7 +799,7 @@ def _load_allowed_tags(sb, limit: int = 200) -> list[str]:
     try:
         rows = sb.table("pro_tag_scores").select("tag").limit(limit).execute().data or []
     except Exception:
-        return []
+        rows = []
     tags = []
     seen = set()
     for row in rows:
@@ -808,6 +808,11 @@ def _load_allowed_tags(sb, limit: int = 200) -> list[str]:
             continue
         seen.add(tag)
         tags.append(tag)
+    if not tags:
+        # Fallback sur les valeurs du TAG_MAPPING si la table pro_tag_scores est vide
+        from .services.pro_tag_scorer import TAG_MAPPING
+        tags = sorted(set(TAG_MAPPING.values()))
+        logger.warning("pro_tag_scores vide, fallback sur TAG_MAPPING (%d tags)", len(tags))
     return tags
 
 
@@ -1830,6 +1835,31 @@ async def pro_search(payload: ProSearchInput):
     ).data or []
 
     profiles_by_id = {row.get("pro_id"): row for row in profiles_rows}
+
+    # P3 fallback: pour les pro_ids absents de public_pro_profiles, chercher dans profiles
+    missing_ids = [pid for pid in ranked_ids if pid not in profiles_by_id]
+    if missing_ids:
+        try:
+            fallback_rows = (
+                sb.table("profiles")
+                .select("id,full_name,company_name,city,postal_code,email,phone,company_description")
+                .in_("id", missing_ids)
+                .eq("user_type", "pro")
+                .execute()
+            ).data or []
+            for row in fallback_rows:
+                profiles_by_id[row["id"]] = {
+                    **row,
+                    "pro_id": row["id"],
+                    "display_name": row.get("full_name"),
+                    "rating_avg": None,
+                    "rating_count": 0,
+                }
+            if fallback_rows:
+                logger.info("pro_search: %d pros récupérés depuis profiles (fallback)", len(fallback_rows))
+        except Exception as exc:
+            logger.warning("pro_search: profiles fallback failed: %s", exc)
+
     results: list[dict] = []
     for pro_id, base_score in ranked:
         profile = profiles_by_id.get(pro_id)

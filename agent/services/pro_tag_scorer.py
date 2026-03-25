@@ -37,6 +37,13 @@ TAG_MAPPING = {
     "étanchéité": "etancheite",
 }
 
+STATUS_FACTOR = {
+    "valide": 1.0,
+    "termine": 1.0,
+    "en_cours": 0.8,
+    "planifie": 0.5,
+}
+
 class ProTagScorer:
     def __init__(self):
         self.supabase = get_client()
@@ -75,7 +82,6 @@ class ProTagScorer:
                 sb.table("lots")
                 .select("id,lot_type,name,status,delay_days")
                 .eq("responsible_user_id", pro_id)
-                .in_("status", ["en_cours", "termine", "valide"])
                 .execute()
                 .data
                 or []
@@ -84,6 +90,7 @@ class ProTagScorer:
                 if not lot or lot.get("id") in seen_lot_ids:
                     continue
                 lot["confidence_factor"] = 1.0
+                lot["status_factor"] = STATUS_FACTOR.get(lot.get("status", ""), 0.4)
                 all_lots.append(lot)
                 seen_lot_ids.add(lot["id"])
                 direct_added += 1
@@ -109,7 +116,6 @@ class ProTagScorer:
                         sb.table("lots")
                         .select("id,lot_type,name,status,delay_days")
                         .in_("phase_id", phase_ids)
-                        .in_("status", ["en_cours", "termine", "valide"])
                         .execute()
                         .data
                         or []
@@ -117,6 +123,7 @@ class ProTagScorer:
                     for lot in phase_lots:
                         if lot and lot.get("id") not in seen_lot_ids:
                             lot["confidence_factor"] = 0.8
+                            lot["status_factor"] = STATUS_FACTOR.get(lot.get("status", ""), 0.4)
                             all_lots.append(lot)
                             seen_lot_ids.add(lot["id"])
                             phase_added += 1
@@ -193,7 +200,6 @@ class ProTagScorer:
                             sb.table("lots")
                             .select("id,lot_type,name,status,delay_days")
                             .in_("phase_id", project_phase_ids)
-                            .in_("status", ["en_cours", "termine", "valide"])
                             .execute()
                             .data
                             or []
@@ -201,6 +207,7 @@ class ProTagScorer:
                         for lot in project_lots:
                             if lot and lot.get("id") not in seen_lot_ids:
                                 lot["confidence_factor"] = 0.6
+                                lot["status_factor"] = STATUS_FACTOR.get(lot.get("status", ""), 0.4)
                                 all_lots.append(lot)
                                 seen_lot_ids.add(lot["id"])
                                 project_added += 1
@@ -298,12 +305,13 @@ class ProTagScorer:
             if not self.sb:
                 return 0
 
-                pro_ids_to_process: List[str]
+            pro_ids_to_process: List[str]
             if pro_id:
                 pro_ids_to_process = [pro_id]
+                logger.info("compute_and_upsert_scores: single pro mode, pro_id=%s", pro_id)
             else:
-                # Recalcule pour les pros potentiellement impactés par des lots "pertinents"
-                relevant_statuses = ["termine", "valide", "en_cours"]
+                # Recalcule pour les pros potentiellement impactés par des lots
+                relevant_statuses = ["termine", "valide", "en_cours", "planifie"]
 
                 direct_rows = (
                     self.sb.table("lots")
@@ -387,6 +395,15 @@ class ProTagScorer:
                     member_pro_ids = {r.get("user_id") for r in member_rows if r and r.get("user_id")}
 
                 pro_ids_to_process = list(direct_pro_ids | phase_managers | project_pro_ids | member_pro_ids)
+                logger.info(
+                    "compute_and_upsert_scores: global recompute, found %d pros "
+                    "(direct=%d, phase_managers=%d, project_owners=%d, members=%d)",
+                    len(pro_ids_to_process),
+                    len(direct_pro_ids),
+                    len(phase_managers),
+                    len(project_pro_ids),
+                    len(member_pro_ids),
+                )
 
             upserts: List[dict] = []
 
@@ -425,10 +442,14 @@ class ProTagScorer:
 
                     confidence = base_score + completion_bonus + specialty_bonus + devis_bonus - delay_penalty
 
-                    avg_confidence_factor = (
-                        sum(l.get("confidence_factor", 1.0) for l in tag_lots) / max(len(tag_lots), 1)
+                    avg_combined_factor = (
+                        sum(
+                            l.get("confidence_factor", 1.0) * l.get("status_factor", 0.5)
+                            for l in tag_lots
+                        )
+                        / max(len(tag_lots), 1)
                     )
-                    confidence = confidence * avg_confidence_factor
+                    confidence = confidence * avg_combined_factor
                     confidence = max(0.10, min(1.0, round(confidence, 4)))
 
                     upserts.append(
@@ -448,9 +469,16 @@ class ProTagScorer:
                 for batch in [upserts[i : i + 500] for i in range(0, len(upserts), 500)]:
                     self.sb.table("pro_tag_scores").upsert(batch, on_conflict="pro_id,tag").execute()
 
-                logger.info("Updated %d pro logic tags.", len(upserts))
+                logger.info(
+                    "compute_and_upsert_scores: upserted %d tag scores for %d pros.",
+                    len(upserts),
+                    len(pro_ids_to_process),
+                )
             else:
-                logger.info("No tags updated.")
+                logger.info(
+                    "compute_and_upsert_scores: no tags upserted (pros=%d).",
+                    len(pro_ids_to_process),
+                )
 
             return len(upserts)
         except Exception as e:
